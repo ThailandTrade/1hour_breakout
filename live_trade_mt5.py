@@ -19,6 +19,10 @@ import psycopg2
 from psycopg2 import extensions as pg_ext
 from dotenv import load_dotenv
 
+
+# ---------- RULES ----------
+MIN_READY_PIPS = float(os.getenv("MIN_READY_PIPS", "6"))  # minimum stop distance (in pips) to allow READY
+
 UTC = timezone.utc
 FIFTEEN_MS = 15 * 60 * 1000
 H1_MS = 60 * 60 * 1000
@@ -944,7 +948,7 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
         if not c15:
             L(f"{pair}: no new 15m to check for break."); return
         brk_side = None; brk_idx = None
-        for i,b in enumerate(c15):
+        for i, b in enumerate(c15):
             if b["close"] > high_1h: brk_side, brk_idx = "LONG", i; break
             if b["close"] < low_1h:  brk_side, brk_idx = "SHORT", i; break
         bump_last_processed(conn, pair, today, int(c15[-1]["ts"]))
@@ -952,7 +956,7 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
             L(f"{pair}: new bars scanned, still no break."); return
         b0 = c15[brk_idx]
         break_open_ts = int(b0["ts"])
-        init_extreme  = b0["high"] if brk_side=="LONG" else b0["low"]
+        init_extreme  = b0["high"] if brk_side == "LONG" else b0["low"]
         update_break_and_extreme(conn, pair, today, brk_side, break_open_ts, init_extreme)
         row = fetch_core(conn, pair, today)
         side = brk_side
@@ -974,7 +978,7 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
     current_sl    = row["sl"]
 
     for b in c15:
-        o,h,l,c = b["open"], b["high"], b["low"], b["close"]
+        o, h, l, c = b["open"], b["high"], b["low"], b["close"]
         ts_open = int(b["ts"])
 
         # FLIP (seulement si pas TRIGGERED)
@@ -995,32 +999,42 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
                 continue
 
         if not ready_seen:
-            if side=="LONG" and (extreme is None or h > extreme):
+            if side == "LONG" and (extreme is None or h > extreme):
                 extreme = h; persist_extreme(conn, pair, today, extreme, ts_open)
-            if side=="SHORT" and (extreme is None or l < extreme):
+            if side == "SHORT" and (extreme is None or l < extreme):
                 extreme = l; persist_extreme(conn, pair, today, extreme, ts_open)
 
-            is_antagonistic = (c < o) if side=="LONG" else (c > o)
+            is_antagonistic = (c < o) if side == "LONG" else (c > o)
             if is_antagonistic:
-                if side=="LONG" and h > extreme:
+                if side == "LONG" and h > extreme:
                     extreme = h; persist_extreme(conn, pair, today, extreme, ts_open)
-                elif side=="SHORT" and l < extreme:
+                elif side == "SHORT" and l < extreme:
                     extreme = l; persist_extreme(conn, pair, today, extreme, ts_open)
+
                 entry = float(extreme)
-                sl    = float(l) if side=="LONG" else float(h)
-                mark_ready(conn, pair, today, ts_open, entry, sl, side, eff_tp_level, e_ms)
-                ready_seen    = True
-                current_entry = round_price(pair, entry)
-                current_sl    = round_price(pair, sl)
+                sl    = float(l) if side == "LONG" else float(h)
+
+                # --- NEW: skip READY if stop distance < MIN_READY_PIPS ---
+                pipsz = pip_size_for(pair)  # 0.01 JPY, 0.0001 otherwise
+                dist_pips = abs(entry - sl) / pipsz
+                if dist_pips < MIN_READY_PIPS:
+                    L(f"READY-SKIP: {pair} pullback OPEN={iso_utc(ts_open)} "
+                      f"dist={dist_pips:.1f} pips < {MIN_READY_PIPS} → ignore trade")
+                else:
+                    mark_ready(conn, pair, today, ts_open, entry, sl, side, eff_tp_level, e_ms)
+                    ready_seen    = True
+                    current_entry = round_price(pair, entry)
+                    current_sl    = round_price(pair, sl)
 
         # Trailing SL/TP tant que READY (pas TRIGGERED)
         if ready_seen and (status != "TRIGGERED"):
-            new_sl = float(l if side=="LONG" else h)
+            new_sl = float(l if side == "LONG" else h)
             if current_sl is None or round_price(pair, new_sl) != current_sl:
                 update_sl_and_tp(conn, pair, today, new_sl, current_entry, side, eff_tp_level, ts_open)
                 current_sl = round_price(pair, new_sl)
 
         bump_last_processed(conn, pair, today, ts_open)
+
 
 # ---------- Main ----------
 def main():
