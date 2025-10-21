@@ -32,6 +32,8 @@ PG_USER = os.getenv("PG_USER", "postgres")
 PG_PASS = os.getenv("PG_PASSWORD", "postgres")
 PG_SSLMODE = os.getenv("PG_SSLMODE", "disable")
 
+MIN_READY_PIPS = float(os.getenv("MIN_READY_PIPS", "6"))  # seuil pips pour valider READY
+
 # ---------- Logging ----------
 def now_iso():
     return datetime.now(tz=UTC).isoformat(timespec="seconds").replace("+00:00","Z")
@@ -408,7 +410,7 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, now_
     if not side or not break_open_ts:
         c15 = read_15m_in_open_window(conn, pair, s_ms, end_excl)
         brk_side = None; brk_idx = None
-        for i,b in enumerate(c15):
+        for i, b in enumerate(c15):
             if b["close"] > high_1h: brk_side, brk_idx = "LONG", i; break
             if b["close"] < low_1h:  brk_side, brk_idx = "SHORT", i; break
         if brk_side is None:
@@ -416,7 +418,7 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, now_
             return
         b0 = c15[brk_idx]
         break_open_ts = int(b0["ts"])
-        init_extreme  = b0["high"] if brk_side=="LONG" else b0["low"]
+        init_extreme  = b0["high"] if brk_side == "LONG" else b0["low"]
         update_break_and_extreme(conn, pair, today, brk_side, break_open_ts, init_extreme)
         row = fetch_core(conn, pair, today)
         side = brk_side
@@ -438,50 +440,57 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, now_
     current_sl    = row["sl"]
 
     for b in c15:
-        o,h,l,c = b["open"], b["high"], b["low"], b["close"]
+        o, h, l, c = b["open"], b["high"], b["low"], b["close"]
         ts_open = int(b["ts"])
 
         if not ready_seen:
-            # maj extreme directionnelle (on stocke l'OPEN de la barre fermée)
-            if side=="LONG" and (extreme is None or h > extreme):
+            # maj extrême directionnelle
+            if side == "LONG" and (extreme is None or h > extreme):
                 extreme = h
                 persist_extreme(conn, pair, today, extreme, ts_open)
-            if side=="SHORT" and (extreme is None or l < extreme):
+            if side == "SHORT" and (extreme is None or l < extreme):
                 extreme = l
                 persist_extreme(conn, pair, today, extreme, ts_open)
 
             # antagoniste ?
-            is_antagonistic = (c < o) if side=="LONG" else (c > o)
+            is_antagonistic = (c < o) if side == "LONG" else (c > o)
             if is_antagonistic:
                 # wick au-delà de l'extrême ?
-                if side=="LONG" and h > extreme:
+                if side == "LONG" and h > extreme:
                     extreme = h; persist_extreme(conn, pair, today, extreme, ts_open)
-                elif side=="SHORT" and l < extreme:
+                elif side == "SHORT" and l < extreme:
                     extreme = l; persist_extreme(conn, pair, today, extreme, ts_open)
 
                 entry = float(extreme)
-                sl    = float(l) if side=="LONG" else float(h)
-                mark_ready(conn, pair, today, ts_open, entry, sl, side, eff_tp_level)
-                ready_seen    = True
-                current_entry = round_price(pair, entry)  # valeur arrondie désormais en BD
-                current_sl    = round_price(pair, sl)
-                L(f"{pair}: READY @ OPEN={iso_utc(ts_open)} entry={fmt_price(pair,current_entry)} sl={fmt_price(pair,current_sl)}")
-                continue  # pas de trigger sur la même barre
+                sl    = float(l) if side == "LONG" else float(h)
 
-        # READY non déclenché → suiveur de SL (et TP) tant que pas de trigger
+                # --- MIN READY PIPS check (nouveau) ---
+                pipsz = pip_size_for(pair)  # 0.01 pour JPY, 0.0001 sinon
+                dist_pips = abs(entry - sl) / pipsz
+                if dist_pips < MIN_READY_PIPS:
+                    L(f"READY-SKIP: {pair} OPEN={iso_utc(ts_open)} dist={dist_pips:.1f} pips < {MIN_READY_PIPS} → ignore")
+                else:
+                    mark_ready(conn, pair, today, ts_open, entry, sl, side, eff_tp_level)
+                    ready_seen    = True
+                    current_entry = round_price(pair, entry)
+                    current_sl    = round_price(pair, sl)
+                    L(f"{pair}: READY @ OPEN={iso_utc(ts_open)} entry={fmt_price(pair,current_entry)} sl={fmt_price(pair,current_sl)}")
+                    continue  # pas de trigger sur la même barre
+
+        # READY non déclenché → suiveur de SL tant que pas TRIGGERED
         if ready_seen and (status != "TRIGGERED"):
-            triggered = (h >= current_entry) if side=="LONG" else (l <= current_entry)
+            triggered = (h >= current_entry) if side == "LONG" else (l <= current_entry)
             if triggered:
                 mark_triggered(conn, pair, today, ts_open)  # OPEN de la barre de trigger
                 status = "TRIGGERED"
                 L(f"{pair}: TRIGGERED @ OPEN={iso_utc(ts_open)}")
                 break
             else:
-                new_sl = float(l if side=="LONG" else h)
-                # si changement, on met à jour (arrondi + TP recalculé)
+                new_sl = float(l if side == "LONG" else h)
                 if current_sl is None or round_price(pair, new_sl) != current_sl:
                     update_sl_and_tp(conn, pair, today, new_sl, current_entry, side, eff_tp_level, ts_open)
                     current_sl = round_price(pair, new_sl)
+
 
 # ---------- Main ----------
 def main():
