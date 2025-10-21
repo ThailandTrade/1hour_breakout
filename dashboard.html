@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Live Trend Dashboard</title>
+<style>
+  :root{
+    --bg:#f7f8fb; --panel:#ffffff; --ink:#171717; --muted:#6b7280; --line:#e5e7eb;
+    --bull:#16a34a; --bear:#dc2626;
+    --chip:#f3f4f6; --chip-border:#e5e7eb; --accent:#2563eb;
+    --glow:#fde047;          /* arrive */
+    --glow-strong:#f59e0b;   /* traverse */
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--ink);
+    font:14px/1.5 system-ui,Segoe UI,Roboto,Inter,Helvetica,Arial}
+  .wrap{max-width:1200px;margin:24px auto;padding:0 16px;display:flex;flex-direction:column;gap:18px}
+  .topbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .pill{background:var(--chip);border:1px solid var(--chip-border);padding:6px 10px;border-radius:999px;color:var(--muted)}
+  .grid{display:flex;flex-direction:column;gap:14px}
+  .section{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  .section h2{margin:0;padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px;color:#374151;display:flex;align-items:center;gap:10px}
+  .scroll{overflow:auto}
+  .table{width:100%;border-collapse:collapse}
+  .table th,.table td{border-bottom:1px solid var(--line);padding:10px 12px;text-align:center;white-space:nowrap}
+  .table th{background:#fafafa;color:#374151;font-weight:600;position:sticky;top:0;z-index:1}
+  .pair{font-weight:600;text-align:left}
+  .tag{font-weight:600;padding:2px 8px;border-radius:999px;border:1px solid var(--line);min-width:72px;text-align:center;display:inline-block}
+  .bull{color:var(--bull);border-color:rgba(22,163,74,.25);background:rgba(22,163,74,.06)}
+  .bear{color:var(--bear);border-color:rgba(220,38,38,.25);background:rgba(220,38,38,.06)}
+  .empty{color:var(--muted);font-size:12px;text-align:center}
+  .dim { opacity:.35; filter:grayscale(.8); }
+
+  /* coloration de ligne (subtile) */
+  tr.row.row-bull td { background: rgba(22,163,74,.06); }
+  tr.row.row-bear td { background: rgba(220,38,38,.06); }
+
+  /* not tradable grisé (ligne entière) */
+  tr.row.row-muted td { background:#f3f4f6; color:var(--muted); }
+
+  /* Infinite glow until ACK */
+  @keyframes glowPulse {
+    0%   { box-shadow: inset 0 0 0 0 rgba(253,224,71,0.00); }
+    50%  { box-shadow: inset 0 0 0 9999px rgba(253,224,71,0.26); }
+    100% { box-shadow: inset 0 0 0 0 rgba(253,224,71,0.00); }
+  }
+  @keyframes glowPulseStrong {
+    0%   { box-shadow: inset 0 0 0 0 rgba(245,158,11,0.00); }
+    50%  { box-shadow: inset 0 0 0 9999px rgba(245,158,11,0.34); }
+    100% { box-shadow: inset 0 0 0 0 rgba(245,158,11,0.00); }
+  }
+  tr.row.glow-arrive td {
+    animation: glowPulse 2.2s ease-in-out infinite;
+    position: relative;
+  }
+  tr.row.glow-traverse td {
+    animation: glowPulseStrong 2.0s ease-in-out infinite;
+    position: relative;
+  }
+  tr.row.glow-arrive td:first-child { border-left:4px solid var(--glow); }
+  tr.row.glow-traverse td:first-child { border-left:4px solid var(--glow-strong); }
+
+  /* ACK button */
+  .ack {
+    display:inline-flex; align-items:center; gap:6px;
+    font-size:12px; padding:2px 8px; border-radius:999px;
+    border:1px solid var(--line); background:#fff; cursor:pointer;
+    margin-left:8px; user-select:none;
+  }
+  .ack:hover { background:#fafafa; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="pill">WS: <span id="wsState">connecting…</span></div>
+    <div class="pill">Dernière MAJ: <span id="lastUpdate">—</span></div>
+    <div class="pill" id="wsUrl">—</div>
+  </div>
+
+  <div class="grid">
+    <!-- NEW: ATTENTION section -->
+    <div class="section" id="attentionSec" style="display:none">
+      <h2>ATTENTION</h2>
+      <div class="scroll"><table class="table" id="attentionTbl"></table></div>
+    </div>
+
+    <div class="section" id="majorsSec">
+      <h2>MAJORS</h2>
+      <div class="scroll"><table class="table" id="majorsTbl"></table></div>
+    </div>
+    <div class="section" id="minorsSec">
+      <h2>MINORS</h2>
+      <div class="scroll"><table class="table" id="minorsTbl"></table></div>
+    </div>
+    <div class="section" id="notTrendSec">
+      <h2>NOT TRADABLE — NO TREND</h2>
+      <div class="scroll"><table class="table" id="notTrendTbl"></table></div>
+    </div>
+    <div class="section" id="noAoiSec">
+      <h2>NOT TRADABLE — NO AOI</h2>
+      <div class="scroll"><table class="table" id="noAoiTbl"></table></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ====== CONFIG / URL builder ====== */
+const DEFAULT_WS_PORT = 8765;
+function computeWSUrl() {
+  const q = new URLSearchParams(location.search);
+  const override = q.get('ws');
+  if (override) return override;
+  const isHttps = location.protocol === 'https:';
+  const proto = isHttps ? 'wss://' : 'ws://';
+  let host = location.hostname || '127.0.0.1';
+  return `${proto}${host}:${DEFAULT_WS_PORT}`;
+}
+const WS_URL = computeWSUrl();
+document.getElementById('wsUrl').textContent = WS_URL;
+
+/* ====== STATE ====== */
+let META = { timeframes: [] };
+const model = {};                      // structure per pair/tf (trend, hh/hl/lh/ll)
+let groups = { majors: [], minors: [] };
+let snapshotReceived = false;
+
+const AOI_PRESENT = Object.create(null); // cache AOI presence by pair
+/* persistent highlights { [pair]: 'arrive' | 'traverse' } */
+const HILIGHTS = Object.create(null);
+
+const el = (sel) => document.querySelector(sel);
+
+/* ====== GLOBAL TREND (1w,1d,4h) ====== */
+const GLOBAL_TF_ORDER = ['1w','1d','4h'];
+
+function trendOf(pair, tf){
+  const d = (model[pair] && model[pair][tf]) || {};
+  return d.trend === 'Bullish' ? 'Bullish' : 'Bearish';
+}
+function computeGlobalTrend(pair){
+  const [t1,t2,t3] = GLOBAL_TF_ORDER;
+  if (!model[pair]) return null;
+  const a = trendOf(pair, t1), b = trendOf(pair, t2), c = trendOf(pair, t3);
+  if (a === b) return a;
+  if (b === c) return b;
+  return null;
+}
+function hasAOI(pair){ return !!AOI_PRESENT[pair]; }
+function isTrendAligned(pair){
+  const [t1,t2,t3] = GLOBAL_TF_ORDER;
+  if (!model[pair]) return false;
+  const a = trendOf(pair, t1), b = trendOf(pair, t2), c = trendOf(pair, t3);
+  return (a === b) || (b === c);
+}
+function isTradable(pair){ return isTrendAligned(pair) && hasAOI(pair); }
+
+function shouldDimCell(pair, tf){
+  const tfs = META.timeframes || [];
+  const idx4h = tfs.indexOf('4h');
+  if (idx4h === -1) return false;
+  const idx = tfs.indexOf(tf);
+  if (idx === -1 || idx <= idx4h) return false;
+  const gtrend = computeGlobalTrend(pair);
+  if (!gtrend) return false;
+  const cellTrend = trendOf(pair, tf);
+  return cellTrend !== gtrend;
+}
+
+/* ====== AOI UTIL ====== */
+function applyAoisList(list){
+  if (!Array.isArray(list)) return;
+  const nextPresence = Object.create(null);
+  for (const item of list) {
+    const p = item?.pair;
+    const bytf = item?.by_tf;
+    if (!p || !bytf) continue;
+    let present = false;
+    for (const k of Object.keys(bytf)) {
+      const arr = bytf[k];
+      if (Array.isArray(arr) && arr.length) { present = true; break; }
+    }
+    if (present) nextPresence[p] = true;
+  }
+  if (list.length > 0) {
+    for (const k in AOI_PRESENT) delete AOI_PRESENT[k];
+    Object.assign(AOI_PRESENT, nextPresence);
+  }
+}
+
+/* ====== ROW CLASSES ====== */
+function rowClassTradable(pair){
+  const g = computeGlobalTrend(pair);
+  const base = g === 'Bullish' ? 'row-bull' : 'row-bear';
+  const hi = HILIGHTS[pair];
+  if (hi === 'traverse') return base + ' glow-traverse';
+  if (hi === 'arrive')   return base + ' glow-arrive';
+  return base;
+}
+function rowClassMuted(pair){
+  const hi = HILIGHTS[pair];
+  if (hi === 'traverse') return 'row-muted glow-traverse';
+  if (hi === 'arrive')   return 'row-muted glow-arrive';
+  return 'row-muted';
+}
+
+/* ====== RENDER ====== */
+function renderTables() {
+  const tfs = (META.timeframes && META.timeframes.length) ? META.timeframes : [];
+  const majorsAll = groups.majors || [];
+  const minorsAll = groups.minors || [];
+
+  // Base buckets
+  const majorsTradable = majorsAll.filter(isTradable);
+  const minorsTradable = minorsAll.filter(isTradable);
+  const noAoi  = [...majorsAll, ...minorsAll].filter(p => !hasAOI(p));
+  const noTrend= [...majorsAll, ...minorsAll].filter(p => hasAOI(p) && !isTrendAligned(p));
+
+  // NEW: ATTENTION = highlighted & tradable (from any group)
+  const attention = [...majorsTradable, ...minorsTradable]
+    .filter(p => HILIGHTS[p])
+    // stable order: majors first, then minors, then alphabetical
+    .sort((a,b)=>{
+      const aMaj = majorsAll.includes(a), bMaj = majorsAll.includes(b);
+      if (aMaj !== bMaj) return aMaj ? -1 : 1;
+      return a.localeCompare(b);
+    });
+
+  // Remove ATTENTION pairs from majors/minors buckets to avoid duplicates
+  const attentionSet = new Set(attention);
+  const majorsTradableRest = majorsTradable.filter(p => !attentionSet.has(p));
+  const minorsTradableRest = minorsTradable.filter(p => !attentionSet.has(p));
+
+  renderGroup(attention,         el('#attentionTbl'), el('#attentionSec'), tfs, rowClassTradable);
+  renderGroup(majorsTradableRest,el('#majorsTbl'),    el('#majorsSec'),    tfs, rowClassTradable);
+  renderGroup(minorsTradableRest,el('#minorsTbl'),    el('#minorsSec'),    tfs, rowClassTradable);
+  renderGroup(noTrend,           el('#notTrendTbl'),  el('#notTrendSec'),  tfs, rowClassMuted);
+  renderGroup(noAoi,             el('#noAoiTbl'),     el('#noAoiSec'),     tfs, rowClassMuted);
+}
+
+function renderGroup(list, tbl, sec, effectiveTFs, rowClassFn) {
+  if (!list || !list.length) { sec.style.display='none'; tbl.innerHTML=''; return; }
+  sec.style.display='';
+
+  const ths = ['PAIR', ...effectiveTFs.map(tf=>tf.toUpperCase())];
+  let html = '<thead><tr>' + ths.map(t=>`<th>${t}</th>`).join('') + '</tr></thead><tbody>';
+
+  for (const pair of list) {
+    const rowKlass = rowClassFn ? rowClassFn(pair) : '';
+    const hi = HILIGHTS[pair];
+    const ackBtn = hi ? `<button class="ack" data-ack="${pair}" title="Marquer comme traité">ACK</button>` : '';
+    html += `<tr class="row ${rowKlass}" data-pair="${pair}">
+      <td class="pair"><span>${pair}</span>${ackBtn}</td>`;
+    for (const tf of effectiveTFs) {
+      const cell = (model[pair] && model[pair][tf]) || {};
+      const trend = (cell.trend === 'Bullish') ? 'Bullish' : 'Bearish';
+      const klass = trend === 'Bullish' ? 'bull' : 'bear';
+      const dim = shouldDimCell(pair, tf) ? ' dim' : '';
+      html += `<td data-tf="${tf}"><span class="tag ${klass}${dim}">${trend}</span></td>`;
+    }
+    html += `</tr>`;
+  }
+  html += '</tbody>';
+  tbl.innerHTML = html;
+}
+
+/* ====== APPLY DATA ====== */
+function applySnapshot(snap) {
+  snapshotReceived = true;
+  META.timeframes = Array.isArray(snap.meta?.timeframes) ? snap.meta.timeframes : [];
+  const majors = Array.isArray(snap.majors) ? snap.majors : [];
+  const minors = Array.isArray(snap.minors) ? snap.minors : [];
+  const aois   = Array.isArray(snap.aois)   ? snap.aois   : [];
+
+  groups.majors = majors.map(x=>x.pair);
+  groups.minors = minors.map(x=>x.pair);
+
+  const seedBlock = (block) => {
+    for (const item of block) {
+      const p = item.pair; if (!p) continue;
+      model[p] = model[p] || {};
+      const full = item.by_tf_full || {};
+      for (const tf of META.timeframes) {
+        const f = full[tf]; if (!f) continue;
+        const bullish = f.hh && f.hl && !f.lh && !f.ll;
+        const bearish = f.lh && f.ll && !f.hh && !f.hl;
+        const trend = bullish ? 'Bullish' : (bearish ? 'Bearish' : 'Bearish');
+        model[p][tf] = { trend, hh:f.hh, hl:f.hl, lh:f.lh, ll:f.ll };
+      }
+    }
+  };
+  seedBlock(majors);
+  seedBlock(minors);
+
+  applyAoisList(aois);
+  renderTables();
+  el('#lastUpdate').textContent = new Date().toLocaleString();
+}
+
+function applyDeltas(deltaMsg) {
+  const changes = Array.isArray(deltaMsg.changes) ? deltaMsg.changes : [];
+  const aois = Array.isArray(deltaMsg.aois) ? deltaMsg.aois : null;
+
+  let requiresFullRerender = false;
+
+  for (const c of changes) {
+    const p = c.pair, tf = c.timeframe;
+    if (!p || !tf) continue;
+    model[p] = model[p] || {};
+    if (c.deleted) {
+      delete model[p][tf];
+      requiresFullRerender = true;
+      continue;
+    }
+    const bullish = c.hh && c.hl && !c.lh && !c.ll;
+    const bearish = c.lh && c.ll && !c.hh && !c.hl;
+    const trend = bullish ? 'Bullish' : (bearish ? 'Bearish' : 'Bearish');
+    const prevTrend = model[p][tf]?.trend;
+    model[p][tf] = { trend, hh:c.hh, hl:c.hl, lh:c.lh, ll:c.ll };
+
+    if (GLOBAL_TF_ORDER.includes(tf) || prevTrend !== trend) {
+      requiresFullRerender = true;
+    }
+  }
+
+  if (aois) { applyAoisList(aois); requiresFullRerender = true; }
+
+  if (requiresFullRerender) renderTables();
+  else changes.forEach(({pair, timeframe}) => patchCell(pair, timeframe));
+
+  el('#lastUpdate').textContent = new Date().toLocaleString();
+}
+
+function patchCell(pair, tf) {
+  const row = document.querySelector(`tr.row[data-pair="${pair}"]`);
+  if (!row) return;
+  const td = row.querySelector(`td[data-tf="${tf}"]`);
+  if (!td) return;
+  const d = model[pair][tf] || {};
+  const trend = d.trend === 'Bullish' ? 'Bullish' : 'Bearish';
+  const klass = trend==='Bullish'?'bull':'bear';
+  const dim = shouldDimCell(pair, tf) ? ' dim' : '';
+  td.innerHTML = `<span class="tag ${klass}${dim}">${trend}</span>`;
+}
+
+/* ====== HILIGHT control (front-side ACK) ====== */
+function addHighlight(pair, kind /* 'arrive' | 'traverse' */){
+  if (!pair || !kind) return;
+  HILIGHTS[pair] = kind;
+  renderTables();
+}
+function clearHighlight(pair){
+  if (!pair) return;
+  delete HILIGHTS[pair];
+  renderTables();
+}
+
+/* ACK interactions */
+document.addEventListener('click', (e)=>{
+  const btn = e.target.closest?.('.ack');
+  if (btn && btn.dataset.ack) {
+    clearHighlight(btn.dataset.ack);
+  }
+});
+document.addEventListener('dblclick', (e)=>{
+  const row = e.target.closest?.('tr.row[data-pair]');
+  if (row) {
+    const pair = row.getAttribute('data-pair');
+    if (HILIGHTS[pair]) clearHighlight(pair);
+  }
+});
+
+/* ====== WS ====== */
+function setWSState(s){ el('#wsState').textContent = s; }
+let ws;
+function connectWS(){
+  setWSState(`connexion… (${WS_URL})`);
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = ()=> {
+    setWSState('connecté');
+    ws.send(JSON.stringify({ role:'dashboard', schema:'1.0' }));
+  };
+
+  ws.onclose = ()=> {
+    setWSState('déconnecté');
+    setTimeout(connectWS, 1500);
+  };
+
+  ws.onerror = ()=> { setWSState('erreur'); };
+
+  ws.onmessage = (evt)=>{
+    let msg; try { msg = JSON.parse(evt.data); } catch { return; }
+    if (msg.type === 'error') { console.error('[WS] error:', msg.message); return; }
+    if (msg.type === 'hello') return;
+
+    if (msg.type === 'snapshot') {
+      applySnapshot(msg);
+    } else if (msg.type === 'delta') {
+      applyDeltas(msg);
+    } else if (msg.type === 'aoi_event') {
+      // msg = { type, pair, prev:{ts,close}, curr:{ts,close}, events:[{tf,low,high,kind,direction}, ...] }
+      const pair = msg.pair;
+      const hasTraverse = (msg.events||[]).some(e => e.kind === 'traverse');
+      addHighlight(pair, hasTraverse ? 'traverse' : 'arrive');
+    }
+  };
+
+  setTimeout(()=>{ if (!snapshotReceived) console.warn('No snapshot yet — check WS URL or server.'); }, 4000);
+}
+
+/* ====== BOOT ====== */
+connectWS();
+</script>
+</body>
+</html>
