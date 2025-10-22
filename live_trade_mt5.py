@@ -1064,7 +1064,6 @@ def main():
                         if not sess_detect:
                             L(f"RUN[{loop_ts}]: no active session — skipping.")
                         else:
-                        if sess_detect:
                             current_session, last_close_ms = sess_detect
                             today = datetime.fromtimestamp(last_close_ms/1000, tz=UTC).date()
                             s_ms, e_ms = session_signal_window_utc_ms(current_session, today)
