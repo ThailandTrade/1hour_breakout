@@ -41,14 +41,14 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "15"))
 
 # ---------- MT5 ----------
 ENABLE_TRADING = os.getenv("ENABLE_TRADING", "true").lower() in ("1","true","yes","y")
-RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.01"))
+RISK_PERCENT = float(os.getenv("RISK_PERCENT", "0.005"))
 USE_EQUITY_FOR_RISK = os.getenv("USE_EQUITY_FOR_RISK","true").lower() in ("1","true","yes","y")
 COMMENT_TAG = os.getenv("COMMENT_TAG", "LIVE_BPULL")
 ALLOWED_DEVIATION_POINTS = int(os.getenv("ALLOWED_DEVIATION_POINTS","20"))
 BROKER_MIN_DISTANCE_BUFFER_POINTS = int(os.getenv("BROKER_MIN_DISTANCE_BUFFER_POINTS","0"))
 EXPIRATION_POLICY = os.getenv("EXPIRATION_POLICY","GTC").upper()   # "GTC" ou "SESSION_END"
 # >>> NEW: levier maximum utilisateur (exposition notionnelle / equity)
-MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "20"))
+MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "10"))
 
 MT5_TERMINAL_PATH = os.getenv("MT5_TERMINAL_PATH")
 MT5_LOGIN = os.getenv("MT5_LOGIN")
