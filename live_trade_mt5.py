@@ -130,7 +130,7 @@ def session_first_h1_window_utc_ms(session: str, d: date) -> Tuple[int,int]:
         start = base + timedelta(hours=7)
         end   = base + timedelta(hours=16)
     else:  # NY
-        start = base + timedelta(hours=12)
+        start = base + timedelta(hours=13)
         end   = base + timedelta(hours=21)
     return int(start.timestamp()*1000), int(end.timestamp()*1000)
 
@@ -144,8 +144,8 @@ def session_signal_window_utc_ms(session: str, d: date) -> Tuple[int,int]:
         start = base + timedelta(hours=8)   # 08:00
         end   = base + timedelta(hours=13)  # 13:00
     else:  # NY
-        start = base + timedelta(hours=13)  # 13:00
-        end   = base + timedelta(hours=18)  # 18:00
+        start = base + timedelta(hours=14)  # 13:00
+        end   = base + timedelta(hours=19)  # 18:00
     return int(start.timestamp()*1000), int(end.timestamp()*1000)
 
 # ---------- Session pairs file ----------
