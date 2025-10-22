@@ -1060,9 +1060,11 @@ def main():
                         L("[ERR] No valid entries in session_pairs.txt")
                     else:
                         all_pairs = [p for _,p,_ in tuples]
+                        sess_detect = detect_current_session(conn, all_pairs)
                         if not sess_detect:
                             L(f"RUN[{loop_ts}]: no active session — skipping.")
                         else:
+                        if sess_detect:
                             current_session, last_close_ms = sess_detect
                             today = datetime.fromtimestamp(last_close_ms/1000, tz=UTC).date()
                             s_ms, e_ms = session_signal_window_utc_ms(current_session, today)
