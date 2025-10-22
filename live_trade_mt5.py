@@ -961,11 +961,17 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
         for i, b in enumerate(c15):
             if b["close"] > high_1h: brk_side, brk_idx = "LONG", i; break
             if b["close"] < low_1h:  brk_side, brk_idx = "SHORT", i; break
-        bump_last_processed(conn, pair, today, int(c15[-1]["ts"]))
+
+        # >>> FIX #1: n'avancer le curseur à la dernière bougie scannée que s'il n'y a PAS de break
         if brk_side is None:
+            bump_last_processed(conn, pair, today, int(c15[-1]["ts"]))
             L(f"{pair}: new bars scanned, still no break."); return
+
         b0 = c15[brk_idx]
         break_open_ts = int(b0["ts"])
+        # Curseur avancé EXACTEMENT à la bougie de break (pour ne pas “manger” un pullback juste après)
+        bump_last_processed(conn, pair, today, break_open_ts)  # <<<
+
         init_extreme  = b0["high"] if brk_side == "LONG" else b0["low"]
         update_break_and_extreme(conn, pair, today, brk_side, break_open_ts, init_extreme)
         row = fetch_core(conn, pair, today)
@@ -991,11 +997,29 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
         o, h, l, c = b["open"], b["high"], b["low"], b["close"]
         ts_open = int(b["ts"])
 
+        # >>> FIX #2: re-synchroniser l'état DB au début de CHAQUE barre
+        row_now = fetch_core(conn, pair, today)
+        if row_now:
+            status_db = (row_now["status"] or "").upper() if row_now["status"] else None
+            ready_seen    = (status_db == "READY") and (row_now["entry"] is not None) and (row_now["sl"] is not None)
+            current_entry = row_now["entry"] if ready_seen else None
+            current_sl    = row_now["sl"]   if ready_seen else None
+            status        = status_db or status
+        # <<<
+
         # FLIP (seulement si pas TRIGGERED)
         if status != "TRIGGERED":
             if side == "LONG" and c < low_1h:
                 L(f"{pair}: FLIP → SHORT (close {fmt_price(pair,c)} < low_1h {fmt_price(pair,low_1h)}) @ {iso_utc(ts_open)}")
                 reset_state_on_flip(conn, pair, today)
+
+                # >>> FIX #3: reset de l'état local après flip
+                ready_seen    = False
+                current_entry = None
+                current_sl    = None
+                status        = None
+                # <<<
+
                 side = "SHORT"; break_open_ts = ts_open; extreme = l
                 update_break_and_extreme(conn, pair, today, side, break_open_ts, extreme)
                 bump_last_processed(conn, pair, today, ts_open)
@@ -1003,6 +1027,14 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
             if side == "SHORT" and c > high_1h:
                 L(f"{pair}: FLIP → LONG (close {fmt_price(pair,c)} > high_1h {fmt_price(pair,high_1h)}) @ {iso_utc(ts_open)}")
                 reset_state_on_flip(conn, pair, today)
+
+                # >>> FIX #3 (même reset en flip inverse)
+                ready_seen    = False
+                current_entry = None
+                current_sl    = None
+                status        = None
+                # <<<
+
                 side = "LONG"; break_open_ts = ts_open; extreme = h
                 update_break_and_extreme(conn, pair, today, side, break_open_ts, extreme)
                 bump_last_processed(conn, pair, today, ts_open)
@@ -1037,7 +1069,7 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
                     current_sl    = round_price(pair, sl)
 
         # Trailing SL/TP tant que READY (pas TRIGGERED)
-        if ready_seen and (status != "TRIGGERED"):
+        if ready_seen and (status != "TRIGGERED") and (current_entry is not None):  # <<< garde-fou current_entry
             new_sl = float(l if side == "LONG" else h)
             if current_sl is None or round_price(pair, new_sl) != current_sl:
                 update_sl_and_tp(conn, pair, today, new_sl, current_entry, side, eff_tp_level, ts_open)
