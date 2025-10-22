@@ -136,14 +136,14 @@ def session_signal_window_utc_ms(session: str, d: date) -> Tuple[int,int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
     s = session.upper()
     if s == "TOKYO":
-        start = base + timedelta(hours=1)
-        end   = base + timedelta(hours=6)
+        start = base + timedelta(hours=1)   # 01:00
+        end   = base + timedelta(hours=6)   # 06:00
     elif s == "LONDON":
-        start = base + timedelta(hours=7)
-        end   = base + timedelta(hours=12)
+        start = base + timedelta(hours=8)   # 08:00
+        end   = base + timedelta(hours=13)  # 13:00
     else:  # NY
-        start = base + timedelta(hours=12)
-        end   = base + timedelta(hours=17)
+        start = base + timedelta(hours=13)  # 13:00
+        end   = base + timedelta(hours=18)  # 18:00
     return int(start.timestamp()*1000), int(end.timestamp()*1000)
 
 # ---------- Session pairs file ----------
@@ -243,19 +243,23 @@ def latest_15m_open_ts_for_pair(conn, pair: str) -> Optional[int]:
 
 def detect_current_session(conn, all_pairs: List[str]) -> Optional[Tuple[str,int]]:
     """
-    Session via CLOSE de la dernière 15m fermée (UTC):
-      TOKYO  : [01:15..06:00] incl. 06:00
-      LONDON : [07:15..12:00] incl. 12:00
-      NY     : [12:15..17:00] incl. 17:00
+    Session via CLOSE of the last CLOSED 15m candle (UTC), with 1H wait before signals:
+
+      TOKYO  : [01:15 .. 06:00]  inclusive
+      LONDON : [08:15 .. 13:00]  inclusive
+      NY     : [13:15 .. 18:00]  inclusive
+
+    If the last 15m CLOSE falls outside these windows, return None (between sessions).
     """
     best_ts_open = None
     best_pair = None
     for p in all_pairs:
         ts = latest_15m_open_ts_for_pair(conn, p)
-        if ts is None: continue
+        if ts is None:
+            continue
         if best_ts_open is None or ts > best_ts_open:
-            best_ts_open = ts
-            best_pair = p
+            best_ts_open, best_pair = ts, p
+
     if best_ts_open is None:
         L("[ERR] No 15m data found for any pair in session file.")
         return None
@@ -264,17 +268,23 @@ def detect_current_session(conn, all_pairs: List[str]) -> Optional[Tuple[str,int
     dt = datetime.fromtimestamp(close_ms/1000, tz=UTC)
     h, m = dt.hour, dt.minute
 
-    if (12 <= h < 17) or (h == 17 and m == 0):
-        sess = "NY"
-    elif (7 <= h < 12) or (h == 12 and m == 0):
+    in_tokyo  = (h == 1 and m >= 15) or (1 < h < 6)  or (h == 6  and m == 0)
+    in_london = (h == 8 and m >= 15) or (8 < h < 13) or (h == 13 and m == 0)
+    in_ny     = (h == 13 and m >= 15) or (13 < h < 18) or (h == 18 and m == 0)
+
+    if in_tokyo:
+        sess = "TOKYO"
+    elif in_london:
         sess = "LONDON"
-    elif (1 <= h < 6) or (h == 6 and m == 0):
-        sess = "TOKYO"
+    elif in_ny:
+        sess = "NY"
     else:
-        sess = "TOKYO"
+        L(f"SESSION: between sessions — last15m_close={iso_utc(close_ms)} via {best_pair}")
+        return None
 
     L(f"SESSION: detected={sess} using {best_pair} last15m_close={iso_utc(close_ms)}")
     return (sess, close_ms)
+
 
 def read_first_h1_OPEN_in_session(conn, pair: str, session: str, d: date) -> Optional[Dict[str,Any]]:
     s, e = session_first_h1_window_utc_ms(session, d)
@@ -1050,8 +1060,9 @@ def main():
                         L("[ERR] No valid entries in session_pairs.txt")
                     else:
                         all_pairs = [p for _,p,_ in tuples]
-                        sess_detect = detect_current_session(conn, all_pairs)
-                        if sess_detect:
+                        if not sess_detect:
+                            L(f"RUN[{loop_ts}]: no active session — skipping.")
+                        else:
                             current_session, last_close_ms = sess_detect
                             today = datetime.fromtimestamp(last_close_ms/1000, tz=UTC).date()
                             s_ms, e_ms = session_signal_window_utc_ms(current_session, today)
