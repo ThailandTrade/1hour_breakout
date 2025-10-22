@@ -47,6 +47,8 @@ COMMENT_TAG = os.getenv("COMMENT_TAG", "LIVE_BPULL")
 ALLOWED_DEVIATION_POINTS = int(os.getenv("ALLOWED_DEVIATION_POINTS","20"))
 BROKER_MIN_DISTANCE_BUFFER_POINTS = int(os.getenv("BROKER_MIN_DISTANCE_BUFFER_POINTS","0"))
 EXPIRATION_POLICY = os.getenv("EXPIRATION_POLICY","GTC").upper()   # "GTC" ou "SESSION_END"
+# >>> NEW: levier maximum utilisateur (exposition notionnelle / equity)
+MAX_LEVERAGE = float(os.getenv("MAX_LEVERAGE", "20"))
 
 MT5_TERMINAL_PATH = os.getenv("MT5_TERMINAL_PATH")
 MT5_LOGIN = os.getenv("MT5_LOGIN")
@@ -470,6 +472,92 @@ def mt5_preflight(symbol: str) -> bool:
 def pip_size_for(symbol: str) -> float:
     return 0.01 if symbol.endswith("JPY") else 0.0001
 
+# >>> NEW: utilitaires exacts pour levier (notionnelle) et risque (P&L)
+def _visible_symbol(sym: str) -> Optional[str]:
+    """Retourne le symbole réellement visible chez le broker (essaie quelques suffixes courants)."""
+    cand = [sym, sym + ".a", sym + ".i", sym + ".pro", sym + ".ecn"]
+    for s in cand:
+        si = mt5.symbol_info(s)
+        if si:
+            return s
+    return None
+
+def _mid_price(sym: str) -> Optional[float]:
+    """Mid bid/ask pour un symbole visible, sinon None."""
+    s = _visible_symbol(sym)
+    if not s: return None
+    tick = mt5.symbol_info_tick(s)
+    if not tick: return None
+    b = getattr(tick, "bid", 0.0) or 0.0
+    a = getattr(tick, "ask", 0.0) or 0.0
+    if b > 0 and a > 0: return (b + a) / 2.0
+    # fallback éventuel
+    last = getattr(tick, "last", 0.0) or 0.0
+    return last if last > 0 else None
+
+_PIVOTS = ["USD","EUR","JPY","GBP","AUD","NZD","CAD","CHF","XAU","XAG"]
+
+def get_rate(num: str, den: str, depth: int = 0) -> Optional[float]:
+    """
+    Prix num/den via MT5 (direct, inverse, ou cross 2 jambes).
+    Ex: get_rate('USD','EUR') ~ 1 / EURUSD ; get_rate('USD','JPY') ~ USDJPY ; etc.
+    """
+    if num == den: return 1.0
+    if depth > 1:  # limite à 2 jambes
+        return None
+
+    # direct
+    p = _mid_price(num + den)
+    if p and p > 0: return p
+    # inverse
+    q = _mid_price(den + num)
+    if q and q > 0: return 1.0 / q
+
+    # cross via pivot
+    for piv in _PIVOTS:
+        if piv == num or piv == den: continue
+        a = get_rate(num, piv, depth + 1)
+        if not a: continue
+        b = get_rate(piv, den, depth + 1)
+        if not b: continue
+        return a * b
+    return None
+
+def _usd_per_base(symbol: str) -> Optional[float]:
+    """
+    USD par unité de BASE du symbole 'symbol' (exact via cotations MT5).
+    Pour EURUSD → USD/EUR = 1 / EURUSD ; pour XAUUSD → USD/XAU = XAUUSD ; etc.
+    """
+    base = symbol[:3].upper()
+    return get_rate("USD", base)
+
+def _notional_usd_per_lot(symbol: str) -> Optional[float]:
+    """
+    Notionnelle USD par lot = contract_size (en unités de BASE) × USD/BASE (au mid MT5).
+    """
+    si = mt5.symbol_info(symbol)
+    if not si: return None
+    contract = float(getattr(si, "trade_contract_size", 0.0) or 0.0)
+    if contract <= 0: return None
+    usd_per_base = _usd_per_base(symbol)
+    if not usd_per_base or usd_per_base <= 0: return None
+    return contract * usd_per_base
+
+def _risk_usd_per_lot(symbol: str, entry: float, sl: float) -> Optional[float]:
+    """
+    Risque (|P&L|) en devise du compte pour 1.0 lot entre entry et sl.
+    Utilise mt5.order_calc_profit (exact, conversion broker).
+    """
+    try:
+        order_type = mt5.ORDER_TYPE_BUY if sl < entry else mt5.ORDER_TYPE_SELL
+        p = mt5.order_calc_profit(order_type, symbol, 1.0, entry, sl)
+        if p is None:
+            return None
+        return abs(float(p))
+    except Exception:
+        return None
+# <<< NEW
+
 def pip_value_per_lot_usd(symbol: str) -> Optional[float]:
     si = mt5.symbol_info(symbol)
     tick = mt5.symbol_info_tick(symbol)
@@ -491,17 +579,45 @@ def round_volume(volume: float, symbol: str) -> float:
     return round(vol, 3)
 
 def calc_lots_risk(symbol: str, risk_pct: float, entry: float, sl: float) -> Optional[float]:
+    """
+    >>> MODIFIÉ <<<
+    Retourne le nombre de lots en respectant:
+      - plafond de risque: equity * risk_pct
+      - plafond de levier: equity * MAX_LEVERAGE >= notionnelle_usd(lots)
+    Le résultat est le min des deux, arrondi au volume_step/bornes broker.
+    """
     ai = mt5.account_info()
-    if not ai: return None
-    capital = float(ai.equity) if USE_EQUITY_FOR_RISK else float(ai.margin_free)
-    target_risk_usd = max(0.0, capital * risk_pct)
-    pv = pip_value_per_lot_usd(symbol)
-    if not pv or pv <= 0: return None
-    pipsz = pip_size_for(symbol)
-    sl_pips = abs(entry - sl) / pipsz
-    if sl_pips <= 0: return None
-    lots = target_risk_usd / (pv * sl_pips)
-    return round_volume(lots, symbol)
+    if not ai:
+        return None
+
+    equity = float(ai.equity)
+    capital = equity if USE_EQUITY_FOR_RISK else float(ai.margin_free)
+
+    # 1) Risque par lot (exact via MT5)
+    risk_per_lot = _risk_usd_per_lot(symbol, entry, sl)
+    if risk_per_lot is None or risk_per_lot <= 0:
+        # fallback ultime (approx) si MT5 ne renvoie rien
+        pv = pip_value_per_lot_usd(symbol)
+        if not pv or pv <= 0:
+            return None
+        pipsz = pip_size_for(symbol)
+        sl_pips = abs(entry - sl) / pipsz
+        if sl_pips <= 0:
+            return None
+        risk_per_lot = pv * sl_pips
+
+    max_risk_usd = max(0.0, capital * risk_pct)
+    lots_risk = max_risk_usd / risk_per_lot if risk_per_lot > 0 else 0.0
+
+    # 2) Notionnelle par lot (exact via cotations/cross MT5)
+    notion_per_lot = _notional_usd_per_lot(symbol)
+    if notion_per_lot is None or notion_per_lot <= 0:
+        return round_volume(lots_risk, symbol)  # si on ne sait pas borner par levier, on garde risque
+
+    lots_lev = (equity * MAX_LEVERAGE) / notion_per_lot
+
+    lots = min(lots_risk, lots_lev)
+    return round_volume(max(0.0, lots), symbol)
 
 def ensure_stop_type_and_distances(symbol: str, side: str, entry: float, sl: float, tp: float) -> Tuple[float,float,float,str]:
     si = mt5.symbol_info(symbol)
@@ -1068,8 +1184,8 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
                     current_entry = round_price(pair, entry)
                     current_sl    = round_price(pair, sl)
 
-        # Trailing SL/TP tant que READY (pas TRIGGERED)
-        if ready_seen and (status != "TRIGGERED") and (current_entry is not None):  # <<< garde-fou current_entry
+        # Trailing SL/TP tant que READY (pas TRIGGERED) et que current_entry existe
+        if ready_seen and (status != "TRIGGERED") and (current_entry is not None):
             new_sl = float(l if side == "LONG" else h)
             if current_sl is None or round_price(pair, new_sl) != current_sl:
                 update_sl_and_tp(conn, pair, today, new_sl, current_entry, side, eff_tp_level, ts_open)
