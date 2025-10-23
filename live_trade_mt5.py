@@ -143,9 +143,9 @@ def session_signal_window_utc_ms(session: str, d: date) -> Tuple[int,int]:
     elif s == "LONDON":
         start = base + timedelta(hours=8)   # 08:00
         end   = base + timedelta(hours=13)  # 13:00
-    else:  # NY
-        start = base + timedelta(hours=14)  # 13:00
-        end   = base + timedelta(hours=19)  # 18:00
+    else:  # NY  (⚠️ ne pas toucher)
+        start = base + timedelta(hours=14)  # 14:00
+        end   = base + timedelta(hours=19)  # 19:00
     return int(start.timestamp()*1000), int(end.timestamp()*1000)
 
 # ---------- Session pairs file ----------
@@ -335,15 +335,17 @@ def read_15m_after_open(conn, pair: str, start_open_ms: int, end_open_ms_excl: i
 def upsert_base_row(conn, pair: str, trade_day: date, session: str, tp_level: str):
     with conn.cursor() as cur:
         cur.execute(f"SELECT 1 FROM {live_tbl()} WHERE pair=%s AND trade_date=%s", (pair, trade_day))
-        exists = cur.fetchone() is not None
-        if not exists:
+    exists = cur.fetchone() is not None
+    if not exists:
+        with conn.cursor() as cur:
             cur.execute(f"""
                 INSERT INTO {live_tbl()} (pair, trade_date, session, tp_level, updated_at)
                 VALUES (%s,%s,%s,%s, NOW())
                 ON CONFLICT (pair,trade_date) DO NOTHING
             """, (pair, trade_day, session, tp_level)); conn.commit()
-            L(f"ROW: INSERT base {pair} {trade_day} session={session} tp={tp_level}")
-        else:
+        L(f"ROW: INSERT base {pair} {trade_day} session={session} tp={tp_level}")
+    else:
+        with conn.cursor() as cur:
             cur.execute(f"""
                 UPDATE {live_tbl()}
                 SET session=%s,
@@ -351,7 +353,7 @@ def upsert_base_row(conn, pair: str, trade_day: date, session: str, tp_level: st
                     updated_at=NOW()
                 WHERE pair=%s AND trade_date=%s
             """, (session, tp_level, pair, trade_day)); conn.commit()
-            L(f"ROW: UPDATE base {pair} {trade_day} session={session} tp={tp_level}")
+        L(f"ROW: UPDATE base {pair} {trade_day} session={session} tp={tp_level}")
 
 def set_range_1h(conn, pair: str, trade_day: date, c1: Dict[str,Any]):
     open_ts = int(c1["ts"])
@@ -491,7 +493,6 @@ def _mid_price(sym: str) -> Optional[float]:
     b = getattr(tick, "bid", 0.0) or 0.0
     a = getattr(tick, "ask", 0.0) or 0.0
     if b > 0 and a > 0: return (b + a) / 2.0
-    # fallback éventuel
     last = getattr(tick, "last", 0.0) or 0.0
     return last if last > 0 else None
 
@@ -747,6 +748,23 @@ def place_mt5_stop_at_ready(conn, pair: str, trade_day: date, side: str,
                             entry_r: float, sl_r: float, tp_r: float, session_end_ms: int):
     if not (ENABLE_TRADING and MT5_ENABLED and mt5_initialize_if_needed()):
         return
+
+    # -- stratégie: ne jamais empiler (pending/position) --
+    try:
+        live_pos = mt5.positions_get(symbol=pair)
+        if live_pos and len(live_pos) > 0:
+            L(f"[MT5] skip place: position already open for {pair}.")
+            return
+    except Exception:
+        pass
+    try:
+        pendings = mt5.orders_get(symbol=pair)
+        if pendings and len(pendings) > 0:
+            L(f"[MT5] skip place: pending order already exists for {pair}.")
+            return
+    except Exception:
+        pass
+
     lots = calc_lots_risk(pair, RISK_PERCENT, entry_r, sl_r)
     if not lots or lots <= 0:
         L(f"[MT5] skip place: invalid lots for {pair}."); return
@@ -793,6 +811,15 @@ def modify_mt5_stop_after_sl_update(conn, pair: str, trade_day: date, new_sl_r: 
 # ---------- DB row helpers (suite) ----------
 def mark_ready(conn, pair: str, trade_day: date, pullback_open_ts: int,
                entry: float, sl: float, side: str, tp_level: str, session_end_ms: int):
+    # -- stratégie: n'armer que si la ligne n'est pas déjà déclenchée/close --
+    with conn.cursor() as cur:
+        cur.execute(f"SELECT status FROM {live_tbl()} WHERE pair=%s AND trade_date=%s", (pair, trade_day))
+        rr = cur.fetchone()
+    st = (rr[0].upper() if rr and rr[0] else None)
+    if st in ("TRIGGERED", "WIN", "LOSS"):
+        L(f"READY-SKIP: {pair} already {st}; not arming another order.")
+        return
+
     if pullback_open_ts >= session_end_ms:
         L(f"[MT5] skip place: session over for {pair} (DB-timed).")
         return
@@ -1078,15 +1105,14 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
             if b["close"] > high_1h: brk_side, brk_idx = "LONG", i; break
             if b["close"] < low_1h:  brk_side, brk_idx = "SHORT", i; break
 
-        # >>> FIX #1: n'avancer le curseur à la dernière bougie scannée que s'il n'y a PAS de break
+        # Avancer le curseur seulement si pas de break (sinon le placer exactement sur la bougie de break)
         if brk_side is None:
             bump_last_processed(conn, pair, today, int(c15[-1]["ts"]))
             L(f"{pair}: new bars scanned, still no break."); return
 
         b0 = c15[brk_idx]
         break_open_ts = int(b0["ts"])
-        # Curseur avancé EXACTEMENT à la bougie de break (pour ne pas “manger” un pullback juste après)
-        bump_last_processed(conn, pair, today, break_open_ts)  # <<<
+        bump_last_processed(conn, pair, today, break_open_ts)  # curseur sur la bougie de break
 
         init_extreme  = b0["high"] if brk_side == "LONG" else b0["low"]
         update_break_and_extreme(conn, pair, today, brk_side, break_open_ts, init_extreme)
@@ -1113,7 +1139,7 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
         o, h, l, c = b["open"], b["high"], b["low"], b["close"]
         ts_open = int(b["ts"])
 
-        # >>> FIX #2: re-synchroniser l'état DB au début de CHAQUE barre
+        # re-sync DB à chaque barre
         row_now = fetch_core(conn, pair, today)
         if row_now:
             status_db = (row_now["status"] or "").upper() if row_now["status"] else None
@@ -1121,41 +1147,37 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
             current_entry = row_now["entry"] if ready_seen else None
             current_sl    = row_now["sl"]   if ready_seen else None
             status        = status_db or status
-        # <<<
 
-        # FLIP (seulement si pas TRIGGERED)
-        if status != "TRIGGERED":
-            if side == "LONG" and c < low_1h:
-                L(f"{pair}: FLIP → SHORT (close {fmt_price(pair,c)} < low_1h {fmt_price(pair,low_1h)}) @ {iso_utc(ts_open)}")
-                reset_state_on_flip(conn, pair, today)
+        # --- HARD GUARD: dès TRIGGERED / WIN / LOSS → on n'arme plus, pas de flip, on avance le curseur
+        if status in ("TRIGGERED", "WIN", "LOSS"):
+            bump_last_processed(conn, pair, today, ts_open)
+            continue
 
-                # >>> FIX #3: reset de l'état local après flip
-                ready_seen    = False
-                current_entry = None
-                current_sl    = None
-                status        = None
-                # <<<
+        # FLIP (seulement si pas TRIGGERED et pas clos)
+        if side == "LONG" and c < low_1h:
+            L(f"{pair}: FLIP → SHORT (close {fmt_price(pair,c)} < low_1h {fmt_price(pair,low_1h)}) @ {iso_utc(ts_open)}")
+            reset_state_on_flip(conn, pair, today)
+            ready_seen    = False
+            current_entry = None
+            current_sl    = None
+            status        = None
+            side = "SHORT"; break_open_ts = ts_open; extreme = l
+            update_break_and_extreme(conn, pair, today, side, break_open_ts, extreme)
+            bump_last_processed(conn, pair, today, ts_open)
+            continue
+        if side == "SHORT" and c > high_1h:
+            L(f"{pair}: FLIP → LONG (close {fmt_price(pair,c)} > high_1h {fmt_price(pair,high_1h)}) @ {iso_utc(ts_open)}")
+            reset_state_on_flip(conn, pair, today)
+            ready_seen    = False
+            current_entry = None
+            current_sl    = None
+            status        = None
+            side = "LONG"; break_open_ts = ts_open; extreme = h
+            update_break_and_extreme(conn, pair, today, side, break_open_ts, extreme)
+            bump_last_processed(conn, pair, today, ts_open)
+            continue
 
-                side = "SHORT"; break_open_ts = ts_open; extreme = l
-                update_break_and_extreme(conn, pair, today, side, break_open_ts, extreme)
-                bump_last_processed(conn, pair, today, ts_open)
-                continue
-            if side == "SHORT" and c > high_1h:
-                L(f"{pair}: FLIP → LONG (close {fmt_price(pair,c)} > high_1h {fmt_price(pair,high_1h)}) @ {iso_utc(ts_open)}")
-                reset_state_on_flip(conn, pair, today)
-
-                # >>> FIX #3 (même reset en flip inverse)
-                ready_seen    = False
-                current_entry = None
-                current_sl    = None
-                status        = None
-                # <<<
-
-                side = "LONG"; break_open_ts = ts_open; extreme = h
-                update_break_and_extreme(conn, pair, today, side, break_open_ts, extreme)
-                bump_last_processed(conn, pair, today, ts_open)
-                continue
-
+        # READY (si pas encore armé)
         if not ready_seen:
             if side == "LONG" and (extreme is None or h > extreme):
                 extreme = h; persist_extreme(conn, pair, today, extreme, ts_open)
@@ -1172,13 +1194,21 @@ def process_pair(conn, session: str, pair: str, tp_level: str, today: date, last
                 entry = float(extreme)
                 sl    = float(l) if side == "LONG" else float(h)
 
-                # --- NEW: skip READY if stop distance < MIN_READY_PIPS ---
-                pipsz = pip_size_for(pair)  # 0.01 JPY, 0.0001 otherwise
+                # skip READY si distance SL < MIN_READY_PIPS
+                pipsz = pip_size_for(pair)
                 dist_pips = abs(entry - sl) / pipsz
                 if dist_pips < MIN_READY_PIPS:
                     L(f"READY-SKIP: {pair} pullback OPEN={iso_utc(ts_open)} "
                       f"dist={dist_pips:.1f} pips < {MIN_READY_PIPS} → ignore trade")
                 else:
+                    # garde-fou supplémentaire juste avant d'armer
+                    row_chk = fetch_core(conn, pair, today)
+                    st_chk = (row_chk["status"].upper() if row_chk and row_chk["status"] else None)
+                    if st_chk in ("TRIGGERED", "WIN", "LOSS"):
+                        L(f"READY-SKIP(late): {pair} already {st_chk}; not arming.")
+                        bump_last_processed(conn, pair, today, ts_open)
+                        continue
+
                     mark_ready(conn, pair, today, ts_open, entry, sl, side, eff_tp_level, e_ms)
                     ready_seen    = True
                     current_entry = round_price(pair, entry)
