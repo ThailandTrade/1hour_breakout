@@ -3,16 +3,17 @@
 """
 Multi-Pairs — Best (Session × w1,w2,w3) per Pair — Expectancy Recap (1 ligne par paire)
 
-RÈGLE MISE À JOUR (clé):
+RÈGLE (mise à jour) :
 - On détermine, pour chaque paire, le meilleur moment (session) pour LANCER un trade.
 - Par session (TOKYO/LONDON/NY), on prend AU PLUS 1 trade par (paire, jour) si l'entrée se produit dans la fenêtre de la session.
 - Peu importe quand le trade se termine (SL/RR3), on NE bloque PAS le jour suivant (pas d'anti-overlap cross-day).
 
-Rappel (inchangé):
-- Entrées: mêmes règles (break strict, pullback antagoniste, entrée wick, SL = bar i-1).
-- Cibles: RR1 / RR2 / RR3 (timestamps), arrêt au 1er SL ou RR3 (pour l'évaluation des hits).
+Entrées & cibles (inchangé, sauf SL de l’entrée cf. plus bas) :
+- Entrées: mêmes règles (break strict, pullback antagoniste, entrée wick), SL = extrême (low/high) depuis le pullback (inclus).
+- Cibles: RR1 / RR2 / RR3 (timestamps), arrêt au 1er SL ou RR3 (pour l’évaluation des hits).
 - WIN/LOSS: WIN si TP1 < SL, sinon LOSS (indépendant des poids).
 - R-multiple: application événementielle des partiels (w1,w2,w3), w1+w2+w3=1.
+- Sessions: TOKYO / LONDON / NY.
 - Sortie: tableau final trié par Expectancy (R) — 1 ligne = la meilleure combinaison par paire.
 
 I/O:
@@ -158,7 +159,7 @@ def read_15m_from(conn, pair: str, start_ms: int) -> List[Dict]:
     except Exception:
         conn.rollback(); return []
 
-# ---------------- FSM / Trade (CORE LOGIC — DO NOT CHANGE) ----------------
+# ---------------- FSM / Trade (CORE LOGIC — DO NOT CHANGE sauf SL depuis pullback) ----------------
 @dataclass
 class Trade:
     side: str              # "LONG" | "SHORT"
@@ -167,14 +168,16 @@ class Trade:
     sl: float
 
 def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
-    # Activation long/short + pullback antagoniste + wick trigger; SL = bar i-1
+    # Activation long/short + pullback antagoniste + wick trigger; SL = lowest/highest depuis pullback (inclus)
     long_active = False
     long_hh: Optional[float] = None
     long_pullback_idx: Optional[int] = None
+    long_min_low_since_pullback: Optional[float] = None  # suivi du plus bas depuis pullback (inclus)
 
     short_active = False
     short_ll: Optional[float] = None
     short_pullback_idx: Optional[int] = None
+    short_max_high_since_pullback: Optional[float] = None  # suivi du plus haut depuis pullback (inclus)
 
     for i, b in enumerate(c15):
         ts, o, h, l, c = b["ts"], b["open"], b["high"], b["low"], b["close"]
@@ -183,30 +186,42 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             long_active = True
             long_hh = h
             long_pullback_idx = None
+            long_min_low_since_pullback = None
 
         if (not short_active) and (c < range_low):
             short_active = True
             short_ll = l
             short_pullback_idx = None
+            short_max_high_since_pullback = None
 
+        # -------- LONG --------
         if long_active:
             prev_hh = long_hh
             if long_pullback_idx is None and (c < o):
                 long_pullback_idx = i
+                long_min_low_since_pullback = l  # inclut la bougie de pullback
+            if long_pullback_idx is not None and i >= 1:
+                prev_low = c15[i-1]["low"]
+                long_min_low_since_pullback = prev_low if long_min_low_since_pullback is None else min(long_min_low_since_pullback, prev_low)
             if (prev_hh is not None) and (long_pullback_idx is not None) and (i > long_pullback_idx) and (h > prev_hh) and (i >= 1):
                 entry_price = prev_hh
-                sl_price = c15[i-1]["low"]
+                sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
                 return Trade("LONG", ts, entry_price, sl_price)
             if (long_hh is None) or (h > long_hh):
                 long_hh = h
 
+        # -------- SHORT --------
         if short_active:
             prev_ll = short_ll
             if short_pullback_idx is None and (c > o):
                 short_pullback_idx = i
+                short_max_high_since_pullback = h  # inclut la bougie de pullback
+            if short_pullback_idx is not None and i >= 1:
+                prev_high = c15[i-1]["high"]
+                short_max_high_since_pullback = prev_high if short_max_high_since_pullback is None else max(short_max_high_since_pullback, prev_high)
             if (prev_ll is not None) and (short_pullback_idx is not None) and (i > short_pullback_idx) and (l < prev_ll) and (i >= 1):
                 entry_price = prev_ll
-                sl_price = c15[i-1]["high"]
+                sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
                 return Trade("SHORT", ts, entry_price, sl_price)
             if (short_ll is None) or (l < short_ll):
                 short_ll = l
@@ -346,8 +361,7 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
         if not tr:
             continue
 
-        # 4) Enregistre les hits (TP1/2/3/SL) pour le calcul R/percentiles.
-        #    On n'utilise pas la clôture pour bloquer le(s) jour(s) suivant(s).
+        # 4) Enregistre les hits pour calculer R/TP%
         _, _, hits, _closed_ts = evaluate_trade_after_entry(conn, pair, tr)
         trades.append(BareTrade(hits=hits))
 

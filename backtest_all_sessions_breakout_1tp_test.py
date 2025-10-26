@@ -247,6 +247,7 @@ class Trade:
     sl: float
 
 # *** ALIGNÉ AVEC LE SCRIPT DE RÉFÉRENCE — SL = BAR i-1 ***
+# *** ALIGNÉ AVEC LE LIVE — SL = min/max depuis le pullback (inclus), sans regarder i-1 ***
 def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
     """
     Break strict (close > high ou close < low), puis pullback antagoniste (close contraire),
@@ -256,12 +257,12 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
     long_active = False
     long_hh: Optional[float] = None
     long_pullback_idx: Optional[int] = None
-    long_min_low_since_pullback: Optional[float] = None  # LOW min depuis le pullback (inclus)
+    long_min_low_since_pullback: Optional[float] = None  # LOW min depuis le pullback (incl.)
 
     short_active = False
     short_ll: Optional[float] = None
     short_pullback_idx: Optional[int] = None
-    short_max_high_since_pullback: Optional[float] = None  # HIGH max depuis le pullback (inclus)
+    short_max_high_since_pullback: Optional[float] = None  # HIGH max depuis le pullback (incl.)
 
     for i, b in enumerate(c15):
         ts, o, h, l, c = b["ts"], b["open"], b["high"], b["low"], b["close"]
@@ -283,24 +284,19 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
         if long_active:
             prev_hh = long_hh
 
-            # Pullback antagoniste = bougie rouge (close < open)
+            # Pullback antagoniste = bougie rouge (close < open) → ancre SL = low de la bougie de pullback
             if long_pullback_idx is None and (c < o):
                 long_pullback_idx = i
                 long_min_low_since_pullback = l  # inclut la bougie de pullback
 
-            # Met à jour le LOW min depuis le pullback à chaque bar suivante
-            if long_pullback_idx is not None and i >= 1:
-                prev_low = c15[i-1]["low"]
-                long_min_low_since_pullback = (
-                    prev_low
-                    if long_min_low_since_pullback is None
-                    else min(long_min_low_since_pullback, prev_low)
-                )
+            # Met à jour le LOW min UNIQUEMENT avec les barres APRÈS le pullback (barre courante)
+            if long_pullback_idx is not None and i > long_pullback_idx:
+                long_min_low_since_pullback = min(long_min_low_since_pullback, l)
 
             # Wick trigger : dépasse le hh du break après le pullback
-            if (prev_hh is not None) and (long_pullback_idx is not None) and (i > long_pullback_idx) and (h > prev_hh) and (i >= 1):
+            if (prev_hh is not None) and (long_pullback_idx is not None) and (i > long_pullback_idx) and (h > prev_hh):
                 entry_price = prev_hh
-                sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
+                sl_price = long_min_low_since_pullback  # ancre depuis pullback (incl.)
                 return Trade("LONG", ts, entry_price, sl_price)
 
             # Suivi du hh courant
@@ -311,24 +307,19 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
         if short_active:
             prev_ll = short_ll
 
-            # Pullback antagoniste = bougie verte (close > open)
+            # Pullback antagoniste = bougie verte (close > open) → ancre SL = high de la bougie de pullback
             if short_pullback_idx is None and (c > o):
                 short_pullback_idx = i
                 short_max_high_since_pullback = h  # inclut la bougie de pullback
 
-            # Met à jour le HIGH max depuis le pullback à chaque bar suivante
-            if short_pullback_idx is not None and i >= 1:
-                prev_high = c15[i-1]["high"]
-                short_max_high_since_pullback = (
-                    prev_high
-                    if short_max_high_since_pullback is None
-                    else max(short_max_high_since_pullback, prev_high)
-                )
+            # Met à jour le HIGH max UNIQUEMENT avec les barres APRÈS le pullback (barre courante)
+            if short_pullback_idx is not None and i > short_pullback_idx:
+                short_max_high_since_pullback = max(short_max_high_since_pullback, h)
 
             # Wick trigger : casse le ll du break après le pullback
-            if (prev_ll is not None) and (short_pullback_idx is not None) and (i > short_pullback_idx) and (l < prev_ll) and (i >= 1):
+            if (prev_ll is not None) and (short_pullback_idx is not None) and (i > short_pullback_idx) and (l < prev_ll):
                 entry_price = prev_ll
-                sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
+                sl_price = short_max_high_since_pullback  # ancre depuis pullback (incl.)
                 return Trade("SHORT", ts, entry_price, sl_price)
 
             # Suivi du ll courant
@@ -336,6 +327,7 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
                 short_ll = l
 
     return None
+
 
 
 # ---------- Évaluation après entrée — LOGIQUE DE RÉFÉRENCE ----------

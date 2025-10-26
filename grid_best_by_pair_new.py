@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Multi-Pairs — Best (Session × w1,w2,w3) per Pair — Expectancy Recap (1 ligne par paire)
+Multi-Pairs — Best (Session × w1,w2,w3) per Pair — Expectancy Recap (1 line per pair)
 
-RÈGLE MISE À JOUR (clé):
-- On détermine, pour chaque paire, le meilleur moment (session) pour LANCER un trade.
-- Par session (TOKYO/LONDON/NY), on prend AU PLUS 1 trade par (paire, jour) si l'entrée se produit dans la fenêtre de la session.
-- Peu importe quand le trade se termine (SL/RR3), on NE bloque PAS le jour suivant (pas d'anti-overlap cross-day).
+Rules (UTC, fixed):
+- Sessions:
+    * TOKYO  : start 00:00, duration 6h → 1H base = 00:00–01:00, 15m window = 01:00–06:00
+    * LONDON : start 07:00, duration 6h → 1H base = 07:00–08:00, 15m window = 08:00–13:00
+    * NY     : start 12:00, duration 6h → 1H base = 12:00–13:00, 15m window = 13:00–18:00
+- Outside these windows: ignored (no default session).
 
-Rappel (inchangé):
-- Entrées: mêmes règles (break strict, pullback antagoniste, entrée wick, SL = bar i-1).
-- Cibles: RR1 / RR2 / RR3 (timestamps), arrêt au 1er SL ou RR3 (pour l'évaluation des hits).
-- WIN/LOSS: WIN si TP1 < SL, sinon LOSS (indépendant des poids).
-- R-multiple: application événementielle des partiels (w1,w2,w3), w1+w2+w3=1.
-- Sortie: tableau final trié par Expectancy (R) — 1 ligne = la meilleure combinaison par paire.
+Strategy:
+- Entry logic: strict break of 1H range, antagonistic pullback close, entry on wick >/< memorized extreme,
+  SL = previous bar (i-1). First valid trade per day & session. No overlap: next entry must be after previous close.
+- Targets: RR1/RR2/RR3 timestamps; stop at first SL or when RR3 is hit.
+- WIN/LOSS label: WIN if TP1 < SL, else LOSS (independent of weights).
+- Partials: event-ordered (w1,w2,w3), w1+w2+w3=1; SL applies -1R on remaining fraction.
 
 I/O:
-- Lit les paires depuis --pairs-file (default: pairs.txt). Format simple: une paire par ligne,
-  ou CSV avec une colonne "pair"/"pairs". Dédoublonnage automatique.
-- Pas de sizing ni de frais: optimisation pure en R.
+- Read pairs from --pairs-file (default: pairs.txt); one per line, or CSV with 'pair'/'pairs' column. Deduped.
+- No sizing, no fees: pure R optimization.
 
 Usage:
   python grid_best_by_pair.py --pairs-file pairs.txt --start-date 2025-01-01 --end-date 2025-12-31
@@ -33,6 +34,11 @@ import psycopg2
 from psycopg2 import extensions as pg_ext
 
 UTC = timezone.utc
+
+# ----------- USER TUNABLES (top-level params) -----------
+# Minimum allowed stop size (in pips). Trades with smaller stop are ignored.
+MIN_PIPS = 0.0
+# --------------------------------------------------------
 
 # ---------------- ENV / DB ----------------
 load_dotenv()
@@ -67,31 +73,30 @@ def day_ms_bounds(d: date) -> Tuple[int, int]:
     end   = start + timedelta(days=1)
     return int(start.timestamp()*1000), int(end.timestamp()*1000)
 
-# ---- Sessions (fenêtres UTC) ----
-def tokyo_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=1)).timestamp()*1000)                # 01:00
-    end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)   # 05:45
-    return start, end
+# ---- Sessions (fixed UTC windows) ----
+SESSION_SPECS = {
+    "TOKYO":  {"start_hour": 0,  "duration_h": 6},
+    "LONDON": {"start_hour": 7,  "duration_h": 6},
+    "NY":     {"start_hour": 12, "duration_h": 6},
+}
 
-def london_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=8)).timestamp()*1000)                # 08:00
-    end   = int((base + timedelta(hours=12, minutes=45)).timestamp()*1000)  # 12:45
-    return start, end
-
-def ny_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 13:00
-    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 17:45
-    return start, end
-
-def window_for_session(session: str, d: date) -> Tuple[int, int]:
+def session_bounds_utc(session: str, d: date) -> Tuple[int, int, int, int]:
+    """
+    Returns (base_start_ms, base_end_ms, m15_start_ms, m15_end_ms) for the given session/day.
+    - base (1H)  : [session_start, session_start+1h)
+    - m15 window : [base_end, session_start+duration)  (end exclusive)
+    Raises ValueError if session is invalid.
+    """
     s = (session or "").strip().upper()
-    if s == "TOKYO":  return tokyo_signal_window(d)
-    if s == "LONDON": return london_signal_window(d)
-    if s in ("NY","NEWYORK","NEW_YORK"): return ny_signal_window(d)
-    return tokyo_signal_window(d)
+    if s not in SESSION_SPECS:
+        raise ValueError(f"Invalid session '{session}'. Valid: TOKYO, LONDON, NY")
+    spec = SESSION_SPECS[s]
+    base_dt = datetime(d.year, d.month, d.day, spec["start_hour"], 0, tzinfo=UTC)
+    base_start = int(base_dt.timestamp()*1000)
+    base_end   = int((base_dt + timedelta(hours=1)).timestamp()*1000)
+    m15_start  = base_end
+    m15_end    = int((base_dt + timedelta(hours=spec["duration_h"]+1)).timestamp()*1000)  # +1h already in m15_start
+    return base_start, base_end, m15_start, m15_end
 
 # ---------------- Helpers ----------------
 def sanitize_pair(pair: str) -> str:
@@ -102,21 +107,27 @@ def table_name(pair: str, tf: str) -> str:
     return f"candles_mt5_{sanitize_pair(pair)}_{tf.lower()}"
 
 def pip_eps_for(pair: str) -> float:
-    return 0.001 if pair.upper().endswith("JPY") else 0.00001
+    up = pair.upper()
+    if up.startswith("XAU"):
+        return 0.01   # align with XAU pip granularity
+    return 0.001 if up.endswith("JPY") else 0.0001
 
 def pip_size_for(pair: str) -> float:
     if pair.upper().startswith("XAU"):
         return 0.01
     return 0.01 if pair.upper().endswith("JPY") else 0.0001
 
+def pips_between(pair: str, a: float, b: float) -> float:
+    """Absolute distance between two prices expressed in pips."""
+    return abs(a - b) / pip_size_for(pair)
+
 # ---------------- DB Readers ----------------
-def read_first_1h(conn, pair: str, d: date) -> Optional[Dict]:
+def read_exact_1h_by_ts(conn, pair: str, ts_ms: int) -> Optional[Dict]:
     t1h = table_name(pair, "1h")
-    day_start, _ = day_ms_bounds(d)
     sql = f"SELECT ts, open, high, low, close FROM {t1h} WHERE ts = %s LIMIT 1"
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (day_start,))
+            cur.execute(sql, (ts_ms,))
             row = cur.fetchone()
             if not row: return None
             ts, o, h, l, c = row
@@ -124,29 +135,35 @@ def read_first_1h(conn, pair: str, d: date) -> Optional[Dict]:
     except Exception:
         conn.rollback(); return None
 
-def read_15m_in(conn, pair: str, start_ms: int, end_ms: int) -> List[Dict]:
+def read_15m_between(conn, pair: str, start_ms: int, end_ms_excl: int) -> List[Dict]:
+    """
+    Select closed 15m bars with ts in [start_ms, end_ms_excl).
+    """
     t15 = table_name(pair, "15m")
     sql = f"""
         SELECT ts, open, high, low, close
         FROM {t15}
-        WHERE ts >= %s AND ts <= %s
+        WHERE ts >= %s AND ts < %s
         ORDER BY ts ASC
     """
     try:
         with conn.cursor() as cur:
-            cur.execute(sql, (start_ms, end_ms))
+            cur.execute(sql, (start_ms, end_ms_excl))
             rows = cur.fetchall()
             return [{"ts": int(ts), "open": float(o), "high": float(h),
                      "low": float(l), "close": float(c)} for ts,o,h,l,c in rows]
     except Exception:
         conn.rollback(); return []
 
-def read_15m_from(conn, pair: str, start_ms: int) -> List[Dict]:
+def read_15m_from_inclusive(conn, pair: str, start_ms: int) -> List[Dict]:
+    """
+    Select future 15m bars with ts >= start_ms (includes the trigger bar).
+    """
     t15 = table_name(pair, "15m")
     sql = f"""
         SELECT ts, open, high, low, close
         FROM {t15}
-        WHERE ts > %s
+        WHERE ts >= %s
         ORDER BY ts ASC
     """
     try:
@@ -167,7 +184,10 @@ class Trade:
     sl: float
 
 def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
-    # Activation long/short + pullback antagoniste + wick trigger; SL = bar i-1
+    """
+    Activation long/short + antagonistic pullback (close opposite) + wick trigger; SL = bar i-1.
+    First valid detection in the provided 15m window.
+    """
     long_active = False
     long_hh: Optional[float] = None
     long_pullback_idx: Optional[int] = None
@@ -179,6 +199,7 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
     for i, b in enumerate(c15):
         ts, o, h, l, c = b["ts"], b["open"], b["high"], b["low"], b["close"]
 
+        # Break activation
         if (not long_active) and (c > range_high):
             long_active = True
             long_hh = h
@@ -189,6 +210,7 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             short_ll = l
             short_pullback_idx = None
 
+        # Long path
         if long_active:
             prev_hh = long_hh
             if long_pullback_idx is None and (c < o):
@@ -200,6 +222,7 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             if (long_hh is None) or (h > long_hh):
                 long_hh = h
 
+        # Short path
         if short_active:
             prev_ll = short_ll
             if short_pullback_idx is None and (c > o):
@@ -216,7 +239,8 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
 # ---------------- After-entry evaluation (CORE LOGIC — DO NOT CHANGE) ----------------
 def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
     """
-    Enregistre les timestamps de RR1/RR2/RR3/SL; stop au premier SL ou RR3.
+    Record timestamps of RR1/RR2/RR3/SL; stop at first SL or when RR3 is hit.
+    Includes the trigger bar (ts >= entry_ts). SL priority if timestamps tie.
     """
     eps = pip_eps_for(pair)
     entry, sl = tr.entry, tr.sl
@@ -234,7 +258,7 @@ def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
     targets = {"RR1": t1, "RR2": t2, "RR3": t3}
     hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None, "RR2": None, "RR3": None}
 
-    future = read_15m_from(conn, pair, tr.entry_ts)
+    future = read_15m_from_inclusive(conn, pair, tr.entry_ts)
     for b in future:
         ts,h,l = b["ts"], b["high"], b["low"]
         if tr.side == "LONG":
@@ -268,12 +292,12 @@ def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
 # ---------------- Partials (w1,w2,w3) -> R-multiple ----------------
 def compute_r_and_close(hit_time: Dict[str, Optional[int]], w1: float, w2: float, w3: float) -> float:
     """
-    Application temporelle des sorties partielles (w1+w2+w3=1):
-      TP1: +w1 * 1R ; rem -= w1
-      TP2: +w2 * 2R ; rem -= w2
-      TP3: +w3 * 3R ; rem -= w3
-      SL : -1R * rem
-    Renvoie le R-multiple total.
+    Event-ordered partial exits (w1+w2+w3=1):
+      TP1: +w1 * 1R ; remaining -= w1
+      TP2: +w2 * 2R ; remaining -= w2
+      TP3: +w3 * 3R ; remaining -= w3
+      SL : -1R * remaining
+    Returns total R multiple.
     """
     t_sl = hit_time.get("SL")
     t1   = hit_time.get("RR1")
@@ -316,47 +340,56 @@ def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
     sl = hits.get("SL")
     return t is not None and (sl is None or t < sl)
 
-# ---------------- Core: générer les trades (par session) ----------------
+# ---------------- Core: generate trades (by session) ----------------
 @dataclass
 class BareTrade:
     hits: Dict[str, Optional[int]]  # {"SL": ts|None, "RR1": ts|None, "RR2": ts|None, "RR3": ts|None}
 
 def collect_trades_for_session(conn, pair: str, start: date, end: date, session: str) -> List[BareTrade]:
-    """
-    Règle: on prend AU PLUS UN trade par (paire, jour) si l'entrée est dans la fenêtre de la session.
-    Peu importe quand il se ferme (SL/RR3), on ne bloque PAS le jour suivant.
-    """
     trades: List[BareTrade] = []
+    last_close_ts: Optional[int] = None
 
     for d in daterange(start, end):
-        # 1) Range H1 du jour
-        c1 = read_first_1h(conn, pair, d)
+        try:
+            base_start, base_end, m15_start, m15_end = session_bounds_utc(session, d)
+        except ValueError:
+            continue
+
+        # Read the 1H base candle (must exist exactly at base_start)
+        c1 = read_exact_1h_by_ts(conn, pair, base_start)
         if not c1:
             continue
-        rh, rl = c1["high"], c1["low"]
+        range_high, range_low = c1["high"], c1["low"]
 
-        # 2) Fenêtre 15m de la session pour ce jour
-        s, e = window_for_session(session, d)
-        c15 = read_15m_in(conn, pair, s, e)
+        # 15m window within session: [base_end, session_end) — end exclusive
+        c15 = read_15m_between(conn, pair, m15_start, m15_end)
         if not c15:
             continue
 
-        # 3) Détecte le PREMIER trade dans la fenêtre (un seul par jour)
-        tr = detect_first_trade_for_day(c15, rh, rl)
+        tr = detect_first_trade_for_day(c15, range_high, range_low)
         if not tr:
             continue
 
-        # 4) Enregistre les hits (TP1/2/3/SL) pour le calcul R/percentiles.
-        #    On n'utilise pas la clôture pour bloquer le(s) jour(s) suivant(s).
-        _, _, hits, _closed_ts = evaluate_trade_after_entry(conn, pair, tr)
+        # ---- MIN PIPS FILTER (ignore tiny-stop trades) ----
+        stop_pips = pips_between(pair, tr.entry, tr.sl)
+        if stop_pips < MIN_PIPS:
+            # Skip this trade due to too small stop size
+            continue
+        # ---------------------------------------------------
+
+        # Anti-overlap: do not open if this entry is before the previous trade is closed
+        if last_close_ts is not None and tr.entry_ts <= last_close_ts:
+            continue
+
+        _, _, hits, closed_ts = evaluate_trade_after_entry(conn, pair, tr)
         trades.append(BareTrade(hits=hits))
 
-        # 5) Passe au jour suivant (JAMAIS de 2e trade ce jour pour cette session/paire)
-        continue
+        if closed_ts is not None:
+            last_close_ts = closed_ts
 
     return trades
 
-# ---------------- Grille des poids ----------------
+# ---------------- Weight grid ----------------
 def weight_grid(step: float = 0.1):
     vals = [round(i*step, 1) for i in range(int(1/step)+1)]
     for w1 in vals:
@@ -367,7 +400,7 @@ def weight_grid(step: float = 0.1):
             if abs(w1 + w2 + w3 - 1.0) <= 1e-9 and (0.0 <= w3 <= 1.0):
                 yield (w1, w2, w3)
 
-# ---------------- Stats pour une combinaison ----------------
+# ---------------- Stats for a weight combo ----------------
 def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float) -> Dict[str, Any]:
     total = len(trades)
     if total == 0:
@@ -386,7 +419,7 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float) 
 
         r_mult = compute_r_and_close(hits, w1, w2, w3)
 
-        # WIN/LOSS = TP1 avant SL
+        # WIN/LOSS = TP1 before SL
         if reached_before(hits, "RR1"):
             r_wins.append(r_mult)
         else:
@@ -405,13 +438,13 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float) 
 
     return {"trades": total, "winrate": winrate, "avg_win": avg_win, "avg_loss": avg_loss, "exp": expectancy, "p1": p1, "p2": p2, "p3": p3}
 
-# ---------------- Chargement des paires ----------------
+# ---------------- Load pairs ----------------
 def load_pairs_from_file(path: str) -> List[str]:
     pairs: List[str] = []
     if not os.path.exists(path):
-        print(f"Erreur: {path} introuvable.")
+        print(f"Error: {path} not found.")
         return pairs
-    # Essaye CSV avec en-tête
+    # Try CSV with header
     try:
         with open(path, "r", newline="") as f:
             reader = csv.DictReader(f)
@@ -426,7 +459,7 @@ def load_pairs_from_file(path: str) -> List[str]:
                     return pairs
     except Exception:
         pass
-    # Fallback: une paire par ligne
+    # Fallback: one pair per line
     with open(path, "r") as f:
         for line in f:
             p = line.strip()
@@ -437,14 +470,13 @@ def load_pairs_from_file(path: str) -> List[str]:
                 pairs.append(up)
     return pairs
 
-# ---------------- Impression du recap final (1 ligne / paire) ----------------
+# ---------------- Print final recap (1 line / pair) ----------------
 def print_final_best_table(rows: List[Dict[str, Any]]):
     try:
         from prettytable import PrettyTable
     except Exception:
         PrettyTable = None
 
-    # Tri par expectancy décroissante
     rows_sorted = sorted(rows, key=lambda r: r["exp"], reverse=True)
 
     if PrettyTable:
@@ -468,11 +500,10 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
                 f"{r['p2']*100:.2f}%",
                 f"{r['p3']*100:.2f}%"
             ])
-        print("\n===== BEST COMBO PAR PAIRE — trié par Expectancy (R) =====")
+        print("\n===== BEST COMBO PER PAIR — sorted by Expectancy (R) =====")
         print(t)
         print("==========================================================")
     else:
-        # Fallback
         print("\nPair\tSession\tw1\tw2\tw3\tTrades\tWinrate\tAvgWinR\tAvgLossR\tExpectancyR\tTP1%\tTP2%\tTP3%")
         for r in rows_sorted:
             print("\t".join([
@@ -492,20 +523,20 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pairs-file", default="pairs.txt", help="Fichier des paires (une par ligne ou CSV avec colonne pair/pairs)")
+    ap.add_argument("--pairs-file", default="pairs.txt", help="Pairs file (one per line or CSV with pair/pairs column)")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date",   default="2025-12-31")
-    ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Pas de grille (fixé à 0.1)")
+    ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Grid step (fixed to 0.1)")
     args = ap.parse_args()
 
     pairs = load_pairs_from_file(args.pairs_file)
     if not pairs:
-        print("Aucune paire trouvée.")
+        print("No pairs found.")
         sys.exit(0)
 
     d0 = parse_date(args.start_date)
     d1 = parse_date(args.end_date)
-    sessions = ["TOKYO", "LONDON", "NY"]
+    sessions = ["TOKYO", "LONDON", "NY"]  # only these; nothing else
 
     best_rows: List[Dict[str, Any]] = []
 
@@ -515,13 +546,13 @@ def main():
             if not pair:
                 continue
 
-            # 1) Collecte des trades par session (une seule fois)
+            # 1) Collect trades once per session
             session_trades: Dict[str, List[BareTrade]] = {}
             for sess in sessions:
-                print(f"[{pair}] Collecte trades — {sess} ...")
+                print(f"[{pair}] Collect trades — {sess} ...")
                 session_trades[sess] = collect_trades_for_session(c, pair, d0, d1, sess)
 
-            # 2) Parcourt la grille (w1,w2,w3) pour chaque session et retient la meilleure combinaison
+            # 2) Sweep weight grid per session and keep the best combo for the pair
             best_for_pair: Optional[Dict[str, Any]] = None
 
             for sess in sessions:
@@ -537,11 +568,10 @@ def main():
                     if (best_for_pair is None) or (row["exp"] > best_for_pair["exp"]):
                         best_for_pair = row
 
-            # 3) Empile la meilleure ligne de la paire si au moins 1 trade
+            # 3) Append the best line for the pair (even if 0 trades, for visibility)
             if best_for_pair and best_for_pair["trades"] > 0:
                 best_rows.append(best_for_pair)
             else:
-                # Ajoute quand même une ligne neutre pour visibilité
                 best_rows.append({
                     "pair": pair, "session": "-",
                     "w1": 0.0, "w2": 0.0, "w3": 1.0,
@@ -549,7 +579,7 @@ def main():
                     "p1": 0.0, "p2": 0.0, "p3": 0.0
                 })
 
-    # 4) Affichage final (1 ligne par paire)
+    # 4) Final display (1 line per pair)
     print_final_best_table(best_rows)
 
 if __name__ == "__main__":
