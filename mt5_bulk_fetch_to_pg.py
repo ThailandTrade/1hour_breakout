@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # mt5_bulk_fetch_to_pg.py
 """
-MT5 -> Postgres ingestor (with EU DST handling) + EMA-50 on insert:
+MT5 -> Postgres ingestor (FIXED server offset, default UTC+3) + EMA-50 on insert:
+
 - Inserts all *closed* candles <= cap (if provided) and stores their OPEN UTC in ts/ts_utc.
-- Per-candle conversion: ts_utc_ms = bar_open_server_ms - offset_ms(bar_time), where offset = +2 (winter) or +3 (summer) per EU DST (EET/EEST).
+- Per-candle conversion (FIXED): ts_utc_ms = bar_open_server_ms - (fixed_offset_h * 3600 * 1000).
 - GAPLESS: OPEN forced to previous CLOSE if available.
 - Iterates pairs.txt (CSV with 'pair' column) and timeframes.txt (list).
 - --to optional: ISO8601 (…Z) or epoch ms. Without --to: cap = last closed bar "now" on server.
 - Adds/maintains ema_50 (NUMERIC) computed during ingestion (EMA(50) with SMA seed).
 - NEW: --pairs allows overriding pairs.txt with a space- or comma-separated list.
+
+Notes:
+- All DST logic removed. We manually manage a constant server offset (default +3).
 """
 
 import os, re, csv, sys, time
@@ -27,10 +31,6 @@ from sqlalchemy.types import Numeric
 # Constants
 # -------------------
 UTC = timezone.utc
-
-MIN_SERVER_OFFSET_HOURS = 2   # EET (winter)
-MAX_SERVER_OFFSET_HOURS = 3   # EEST (summer)
-
 BATCH_BARS = 10000
 
 EMA_LEN = 50
@@ -78,13 +78,11 @@ def get_pg_engine():
     return engine
 
 def ensure_ema_column(engine, table_name: str, scale: int):
-    """Ensure ema_50 column exists."""
     sql = text(f'ALTER TABLE IF EXISTS "{table_name}" ADD COLUMN IF NOT EXISTS ema_50 NUMERIC(20,{scale});')
     with engine.begin() as conn:
         conn.execute(sql)
 
 def get_last_row(engine, table) -> Tuple[Optional[int], Optional[Decimal], Optional[Decimal]]:
-    """Return (last_ts, last_close, last_ema_50)."""
     with engine.connect() as c:
         row = c.execute(
             select(table.c.ts, table.c.close, table.c.ema_50).order_by(desc(table.c.ts)).limit(1)
@@ -97,7 +95,6 @@ def get_last_row(engine, table) -> Tuple[Optional[int], Optional[Decimal], Optio
         return last_ts, last_close, last_ema
 
 def fetch_recent_closes(engine, table, n: int, before_ts: Optional[int]) -> List[Decimal]:
-    """Fetch up to n closes BEFORE before_ts (exclusive) ordered ASC."""
     with engine.connect() as c:
         if before_ts is None:
             q = select(table.c.close).order_by(table.c.ts.asc()).limit(n)
@@ -120,14 +117,7 @@ def parse_pairs(path: str) -> List[str]:
     return pairs
 
 def parse_pairs_cli(s: str) -> List[str]:
-    """
-    Parse --pairs argument: accepts space- or comma-separated list.
-    Examples:
-      --pairs "EURUSD GBPUSD USDJPY"
-      --pairs "EURUSD,GBPUSD,USDJPY"
-    """
     toks = [t.strip().upper() for t in re.split(r"[,\s]+", s.strip()) if t.strip()]
-    # Basic sanity filter: 6+ letters (handles metals too, e.g., XAUUSD)
     return [t for t in toks if len(t) >= 6]
 
 def parse_timeframes(path: str) -> List[str]:
@@ -152,42 +142,15 @@ def compute_initial_start_utc(tf: str) -> datetime:
     return datetime.now(UTC) - timedelta(days=days)
 
 # -------------------
-# EU DST helpers
+# Fixed offset helpers (no DST)
 # -------------------
-def last_sunday(year: int, month: int) -> datetime:
-    if month == 12:
-        next_month = datetime(year + 1, 1, 1, tzinfo=UTC)
-    else:
-        next_month = datetime(year, month + 1, 1, tzinfo=UTC)
-    d = next_month - timedelta(days=1)
-    while d.weekday() != 6:
-        d -= timedelta(days=1)
-    return d.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=UTC)
+def utc_ms_to_server_ms(utc_ms: int, fixed_hours: int) -> int:
+    """UTC -> SERVER (apply fixed offset)."""
+    return utc_ms + fixed_hours * 3600 * 1000
 
-def eu_dst_start_utc(year: int) -> datetime:
-    return last_sunday(year, 3) + timedelta(hours=1)
-
-def eu_dst_end_utc(year: int) -> datetime:
-    return last_sunday(year, 10) + timedelta(hours=1)
-
-def server_offset_hours_for_server_ms(bar_open_server_ms: int, mode: str, fixed_hours: int) -> int:
-    """Offset à utiliser quand on convertit un timestamp SERVEUR -> UTC pour chaque bougie."""
-    if mode == "fixed":
-        return fixed_hours
-    prelim_utc_ms = bar_open_server_ms - (2 * 3600 * 1000)  # hypothèse min pour déterminer l'année/jour
-    dt_utc = datetime.fromtimestamp(prelim_utc_ms / 1000, tz=UTC)
-    start = eu_dst_start_utc(dt_utc.year)
-    end   = eu_dst_end_utc(dt_utc.year)
-    return 3 if (start <= dt_utc < end) else 2
-
-def server_offset_hours_for_utc_ms(utc_ms: int, mode: str, fixed_hours: int) -> int:
-    """Offset à utiliser quand on convertit un timestamp UTC -> SERVEUR (pour --to ou pour 'now')."""
-    if mode == "fixed":
-        return fixed_hours
-    dt_utc = datetime.fromtimestamp(utc_ms / 1000, tz=UTC)
-    start = eu_dst_start_utc(dt_utc.year)
-    end   = eu_dst_end_utc(dt_utc.year)
-    return 3 if (start <= dt_utc < end) else 2
+def server_ms_to_utc_ms(server_ms: int, fixed_hours: int) -> int:
+    """SERVER -> UTC (remove fixed offset)."""
+    return server_ms - fixed_hours * 3600 * 1000
 
 # -------------------
 # --to parsing
@@ -208,14 +171,12 @@ def parse_to_ms(to_arg: Optional[str]) -> Optional[int]:
 # -------------------
 # MT5
 # -------------------
-def mt5_now_server_ms_frozen(tz_mode: str, fixed_hours: int) -> int:
+def mt5_now_server_ms_frozen(fixed_hours: int) -> int:
     """
-    Fige 'now' côté SERVEUR une seule fois pour tout le run.
-    On part de l'horloge UTC locale et on ajoute l'offset serveur (EU DST ou fixed).
+    Freeze 'now' on SERVER once (fixed offset).
     """
     utc_now_ms = int(time.time() * 1000)
-    off_h = server_offset_hours_for_utc_ms(utc_now_ms, tz_mode, fixed_hours)
-    return utc_now_ms + off_h * 3600 * 1000
+    return utc_ms_to_server_ms(utc_now_ms, fixed_hours)
 
 def copy_rates_chunk(symbol: str, tf: str, start_naive, end_naive):
     data = mt5.copy_rates_range(symbol, TF_MT5[tf], start_naive, end_naive)
@@ -226,7 +187,8 @@ def copy_rates_chunk(symbol: str, tf: str, start_naive, end_naive):
 # -------------------
 # Core
 # -------------------
-def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mode: str, fixed_hours: int, now_server_ms_fixed: int):
+def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
+                    fixed_hours: int, now_server_ms_fixed: int):
     base, quote = pair[:3], pair[3:]
     sym = None
     for cand in [pair, pair + ".a", pair + ".i", pair + ".pro", pair + ".ecn"]:
@@ -255,7 +217,7 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
         Column("base", String(8)),
         Column("quote", String(8)),
         Column("timeframe", String(8)),
-        Column("ema_50", Numeric(20, scale)),        # EMA on insert
+        Column("ema_50", Numeric(20, scale)),
     )
     meta.create_all(engine, checkfirst=True)
     ensure_ema_column(engine, table_name, scale)
@@ -263,7 +225,7 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
     # resume state
     last_ts, last_close, last_ema = get_last_row(engine, table)
 
-    # Start point: UTC -> server-naive with minimal offset so we don't miss early bars
+    # Start point: UTC -> server-naive with fixed offset so we don't miss early bars
     if last_ts:
         start_utc = datetime.fromtimestamp((last_ts + 1) / 1000, tz=UTC)
         resume_mode = True
@@ -271,24 +233,23 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
         start_utc = compute_initial_start_utc(tf)
         resume_mode = False
 
-    start_server_naive = (start_utc + timedelta(hours=MIN_SERVER_OFFSET_HOURS)).replace(tzinfo=None)
+    start_server_naive = (start_utc + timedelta(hours=fixed_hours)).replace(tzinfo=None)
 
-    # ---- CAP: dernier OPEN de bougie FERMÉE à min(NOW_SERVEUR, --to_SERVEUR) ----
+    # ---- CAP: last OPEN of a CLOSED bar at min(NOW_SERVER, --to_SERVER) ----
     tf_ms = TF_MS[tf]
 
-    # cap "now" gelé
+    # cap "now" frozen
     cap_server_ms_now = (now_server_ms_fixed // tf_ms) * tf_ms - tf_ms
 
-    # cap "--to" si fourni (UTC -> serveur)
+    # cap "--to" if provided (UTC -> server)
     if user_to_ms is not None:
-        off_h_to = server_offset_hours_for_utc_ms(user_to_ms, tz_mode, fixed_hours)
-        to_server_ms = user_to_ms + off_h_to * 3600 * 1000
+        to_server_ms = utc_ms_to_server_ms(user_to_ms, fixed_hours)
         cap_server_ms_to = (to_server_ms // tf_ms) * tf_ms - tf_ms
         last_closed_open_ms_cap = min(cap_server_ms_now, cap_server_ms_to)
     else:
         last_closed_open_ms_cap = cap_server_ms_now
 
-    # Fenêtre MT5 de fin: cap +1s (pour ne pas rater la bougie exactement au cap)
+    # end window for MT5: cap +1s
     end_server_naive = datetime.fromtimestamp(last_closed_open_ms_cap / 1000).replace(tzinfo=None) + timedelta(seconds=1)
 
     if start_server_naive >= end_server_naive:
@@ -322,23 +283,22 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
                 for r in rates:
                     bar_open_server_ms = int(r["time"]) * 1000
 
-                    # Ne pas dépasser le dernier OPEN fermé au cap effectif
+                    # Do not exceed last CLOSED OPEN at cap
                     if bar_open_server_ms > last_closed_open_ms_cap:
                         continue
 
-                    # Offset dynamique par bougie (serveur -> UTC)
-                    off_h = server_offset_hours_for_server_ms(bar_open_server_ms, tz_mode, fixed_hours)
-                    ts_utc_ms = bar_open_server_ms - off_h * 3600 * 1000
+                    # Fixed conversion server -> UTC
+                    ts_utc_ms = server_ms_to_utc_ms(bar_open_server_ms, fixed_hours)
 
-                    # (Sécurité additionnelle côté utilisateur, mais non nécessaire avec le cap serveur)
+                    # Safety cap at user_to (UTC)
                     if user_to_ms is not None and ts_utc_ms > user_to_ms:
                         continue
 
-                    # Reprise
+                    # Resume skip
                     if last_ts and ts_utc_ms <= last_ts:
                         continue
 
-                    # OHLC (gapless open)
+                    # OHLC with gapless open
                     mt5_o = qround(r["open"],  scale)
                     mt5_h = qround(r["high"],  scale)
                     mt5_l = qround(r["low"],   scale)
@@ -351,7 +311,7 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
 
                     v = float(r["tick_volume"])  # FX: tick volume only
 
-                    # --- EMA(50) computation ---
+                    # EMA(50)
                     ema_val: Optional[Decimal] = None
                     if ema_prev is not None:
                         ema_val = qround(EMA_ALPHA * c + (Decimal(1) - EMA_ALPHA) * ema_prev, scale)
@@ -363,7 +323,7 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
                             ema_prev = sma
                             ema_val = sma
                         else:
-                            ema_val = None  # en cours de seeding
+                            ema_val = None
 
                     rows.append({
                         "ts": ts_utc_ms,
@@ -375,7 +335,7 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
                     })
 
                     prev_close = c
-                    last_ts = ts_utc_ms  # avance le curseur
+                    last_ts = ts_utc_ms
 
                 if rows:
                     res = conn.execute(
@@ -398,11 +358,10 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], tz_mo
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--to", help="Optional cap: ISO8601 UTC like 2025-01-01T00:00:00Z or epoch ms", default=None)
-    ap.add_argument("--server-tz", choices=["eu", "fixed"], default=os.getenv("SERVER_TZ_MODE", "eu"),
-                    help="Server timezone mode: 'eu' (EET/EEST DST) or 'fixed' (constant offset).")
+    # FIXED offset only (default +3 hours)
     ap.add_argument("--server-offset-hours", type=int, default=int(os.getenv("SERVER_OFFSET_HOURS", "3")),
-                    help="Server offset hours if --server-tz=fixed (e.g., 2 or 3).")
-    ap.add_argument("--pairs-file", default=os.getenv("PAIRS_FILE", "pairs.txt"),
+                    help="Fixed server offset hours (e.g., 3 for UTC+3).")
+    ap.add_argument("--pairs-file", default=os.getenv("PAIRS_FILE", "session_pairs.txt"),
                     help="Path to pairs file (CSV with column 'pair').")
     ap.add_argument("--timeframes-file", default=os.getenv("TIMEFRAMES_FILE", "timeframes.txt"),
                     help="Path to timeframes file (list).")
@@ -411,6 +370,7 @@ def main():
     args = ap.parse_args()
 
     user_to_ms = parse_to_ms(args.to)
+    fixed_hours = int(args.server_offset_hours)
 
     if not mt5.initialize():
         print("[ERR] MT5 init failed", mt5.last_error())
@@ -439,15 +399,19 @@ def main():
         mt5.shutdown()
         sys.exit(3)
 
-    # ---- NOW SERVEUR GELÉ POUR TOUT LE RUN ----
-    now_server_ms_fixed = mt5_now_server_ms_frozen(args.server_tz, args.server_offset_hours)
-    # (log utile pour débug)
+    # ---- Freeze server "now" once (fixed offset) ----
+    now_server_ms_fixed = mt5_now_server_ms_frozen(fixed_hours=fixed_hours)
     dt_now_srv = datetime.fromtimestamp(now_server_ms_fixed/1000, tz=UTC).isoformat(timespec="seconds")
-    print(f"[INFO] Frozen server-now (approx): {dt_now_srv} @server_tz={args.server_tz} off={args.server_offset_hours}h", flush=True)
+    print(f"[INFO] Frozen server-now≈ {dt_now_srv}  (offset=+{fixed_hours}h)", flush=True)
 
     for pair in pairs:
         for tf in tfs:
-            fetch_and_store(engine, pair, tf, user_to_ms, tz_mode=args.server_tz, fixed_hours=args.server_offset_hours, now_server_ms_fixed=now_server_ms_fixed)
+            fetch_and_store(
+                engine, pair, tf,
+                user_to_ms=user_to_ms,
+                fixed_hours=fixed_hours,
+                now_server_ms_fixed=now_server_ms_fixed
+            )
 
     mt5.shutdown()
     print("[DONE] All tasks complete.")
