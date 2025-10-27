@@ -402,7 +402,7 @@ def main():
                     help="Server timezone mode: 'eu' (EET/EEST DST) or 'fixed' (constant offset).")
     ap.add_argument("--server-offset-hours", type=int, default=int(os.getenv("SERVER_OFFSET_HOURS", "3")),
                     help="Server offset hours if --server-tz=fixed (e.g., 2 or 3).")
-    ap.add_argument("--pairs-file", default=os.getenv("PAIRS_FILE", "pairs.txt"),
+    ap.add_argument("--pairs-file", default=os.getenv("PAIRS_FILE", "session_pairs.txt"),
                     help="Path to pairs file (CSV with column 'pair').")
     ap.add_argument("--timeframes-file", default=os.getenv("TIMEFRAMES_FILE", "timeframes.txt"),
                     help="Path to timeframes file (list).")

@@ -104,7 +104,7 @@ def tokyo_signal_window(d:date)->Tuple[int,int]:
     return int((base+timedelta(hours=1)).timestamp()*1000), int((base+timedelta(hours=5,minutes=45)).timestamp()*1000)
 def london_signal_window(d:date)->Tuple[int,int]:
     base=datetime(d.year,d.month,d.day,tzinfo=UTC)
-    return int((base+timedelta(hours=8)).timestamp()*1000), int((base+timedelta(hours=12,minutes=45)).timestamp()*1000)
+    return int((base+timedelta(hours=9)).timestamp()*1000), int((base+timedelta(hours=13,minutes=45)).timestamp()*1000)
 def ny_signal_window(d:date)->Tuple[int,int]:
     base=datetime(d.year,d.month,d.day,tzinfo=UTC)
     return int((base+timedelta(hours=13)).timestamp()*1000), int((base+timedelta(hours=17,minutes=45)).timestamp()*1000)
@@ -473,9 +473,10 @@ def cancel_pending_mt5_order_if_any(conn,pair:str,d:date):
             L(f"[MT5] cancel failed {None if r is None else r.retcode}")
         else:
             L(f"[MT5] CANCELLED pending order={oid}")
+    # ===== CHANGED: keep mt5_order_id for safe attribution
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET order_status='CANCELLED',
-                        mt5_order_id=NULL, mt5_request_id=NULL, mt5_order_type=NULL, updated_at=NOW()
+                        mt5_request_id=NULL, mt5_order_type=NULL, updated_at=NOW()
                         WHERE pair=%s AND trade_date=%s""",(pair,d)); conn.commit()
 
 # ---------- AJOUT UNIQUE: helper remplacement ordre avec recalcul des lots ----------
@@ -539,6 +540,15 @@ def reconcile_with_mt5(conn, pair:str, today:date):
         return
     # <<<<<<<<<<<<<<<<<<<<<<<<<< AJOUT (2)
 
+    # ===== NEW: do not set TRIGGERED after the session window is over
+    try:
+        s_ms, e_ms = session_signal_window((row["session"] or ""), today)
+        now_ms = int(datetime.now(tz=UTC).timestamp()*1000)
+        if now_ms >= e_ms:
+            return
+    except Exception:
+        pass
+
     oid    = row.get("mt5_order_id")
 
     # A) Position en vie ?
@@ -553,18 +563,64 @@ def reconcile_with_mt5(conn, pair:str, today:date):
     except Exception:
         pos = None
 
-    # B) Passage TRIGGERED si position détectée
-    if pos and status != "TRIGGERED":
-        t = getattr(pos, "time_msc", None) or getattr(pos, "time", None)
-        opened_ms = int(t) if (t and int(t)>10_000_000_000) else (int(t)*1000 if t else int(datetime.now(tz=UTC).timestamp()*1000))
-        mark_triggered(conn, pair, today, opened_ms)
+    # ===== REPLACED: robust attribution to mark TRIGGERED
+    if (status != "TRIGGERED") and oid:
+        # Prefer robust attribution via deals (entry event within session window)
         try:
-            with conn.cursor() as cur:
-                cur.execute(f"""UPDATE {live_tbl()} SET order_status='FILLED', updated_at=NOW()
-                                WHERE pair=%s AND trade_date=%s""", (pair, today)); conn.commit()
+            now = datetime.now(tz=UTC)
+            t_from = datetime(today.year, today.month, today.day, tzinfo=UTC)  # start of day
+            deals = mt5.history_deals_get(t_from, now) or []
+            DEAL_ENTRY_IN = getattr(mt5, "DEAL_ENTRY_IN", 0)
+            entry_deal = None
+            for d in deals:
+                if getattr(d, "symbol", "") != pair:
+                    continue
+                if getattr(d, "entry", None) != DEAL_ENTRY_IN:
+                    continue
+                cmt = (getattr(d, "comment", "") or "")
+                t_msc = getattr(d, "time_msc", None) or getattr(d, "time", None)
+                if not t_msc:
+                    continue
+                entry_ms = int(t_msc) if int(t_msc) > 10_000_000_000 else int(t_msc) * 1000
+                # session-bounded attribution (+15m grace)
+                if entry_ms < s_ms or entry_ms > (e_ms + FIFTEEN_MS):
+                    continue
+                # prefer our tag but allow brokers that strip comments
+                if (COMMENT_TAG in cmt) or True:
+                    if (entry_deal is None) or (entry_ms > (getattr(entry_deal, "time_msc", 0) or 0)):
+                        entry_deal = d
+
+            if entry_deal is not None:
+                entry_t = getattr(entry_deal, "time_msc", None) or getattr(entry_deal, "time", None)
+                opened_ms = int(entry_t) if int(entry_t) > 10_000_000_000 else int(entry_t) * 1000
+                if opened_ms:
+                    opened_ms -= MT5_SERVER_TZ_OFFSET_HOURS * 3600 * 1000
+                mark_triggered(conn, pair, today, opened_ms or int(now.timestamp()*1000))
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(f"""UPDATE {live_tbl()} SET order_status='FILLED', updated_at=NOW()
+                                        WHERE pair=%s AND trade_date=%s""", (pair, today)); conn.commit()
+                except Exception:
+                    pass
+                return
         except Exception:
             pass
-        return
+
+        # Fallback: only if a live position exists, we're still READY, and still within window
+        if pos:
+            if status == "READY" and (row.get("order_status") in ("PLACED", "REJECTED", "CANCELLED")):
+                t = getattr(pos, "time_msc", None) or getattr(pos, "time", None)
+                if t:
+                    opened_ms = int(t) if int(t) > 10_000_000_000 else int(t) * 1000
+                    if s_ms <= opened_ms <= (e_ms + FIFTEEN_MS):
+                        mark_triggered(conn, pair, today, opened_ms)
+                        try:
+                            with conn.cursor() as cur:
+                                cur.execute(f"""UPDATE {live_tbl()} SET order_status='FILLED', updated_at=NOW()
+                                                WHERE pair=%s AND trade_date=%s""", (pair, today)); conn.commit()
+                        except Exception:
+                            pass
+                        return
 
     # C) Plus de position, on était TRIGGERED → déterminer issue via deals
     if status == "TRIGGERED" and (pos is None):
