@@ -78,13 +78,13 @@ def tokyo_signal_window(d: date) -> Tuple[int, int]:
 def london_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
     start = int((base + timedelta(hours=8)).timestamp()*1000)                 # 08:00
-    end   = int((base + timedelta(hours=13, minutes=45)).timestamp()*1000)   # 13:45
+    end   = int((base + timedelta(hours=14, minutes=45)).timestamp()*1000)   # 14:45
     return start, end
 
 def ny_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 13:00
-    end   = int((base + timedelta(hours=18, minutes=45)).timestamp()*1000)   # 18:45
+    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 12:00
+    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 16:45
     return start, end
 
 def window_for_session(session: str, d: date) -> Tuple[int, int]:

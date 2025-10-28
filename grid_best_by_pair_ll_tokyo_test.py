@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone, date
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import extensions as pg_ext
+from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
 
@@ -69,22 +70,27 @@ def day_ms_bounds(d: date) -> Tuple[int, int]:
     return int(start.timestamp()*1000), int(end.timestamp()*1000)
 
 # ---- Sessions (fenêtres UTC) ----
-def tokyo_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=1)).timestamp()*1000)                # 01:00
-    end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)   # 05:45
-    return start, end
+def session_window_utc(d: date, tz_name: str, start_h: int, start_m: int, end_h: int, end_m: int) -> tuple[int,int]:
+    """Fenêtre définie en heure locale (marché) -> renvoie (start_ms, end_ms) en UTC."""
+    local_tz = ZoneInfo(tz_name)
+    start_local = datetime(d.year, d.month, d.day, start_h, start_m, tzinfo=local_tz)
+    end_local   = datetime(d.year, d.month, d.day, end_h,   end_m,   tzinfo=local_tz)
+    start_ms = int(start_local.astimezone(UTC).timestamp() * 1000)
+    end_ms   = int(end_local  .astimezone(UTC).timestamp() * 1000)
+    return start_ms, end_ms
 
-def london_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=8)).timestamp()*1000)                 # 08:00
-    end   = int((base + timedelta(hours=12, minutes=45)).timestamp()*1000)   # 12:45
-    return start, end
+# --- Fenêtres de session (définies en heure locale marché) ---
+def tokyo_signal_window(d: date) -> tuple[int, int]:
+    # Tokyo ne change pas d’heure : 10:00–14:45 JST (≈ 01:00–05:45 UTC toute l’année)
+    return session_window_utc(d, "Asia/Tokyo", 10, 0, 14, 45)
 
-def ny_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 12:00
-    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 16:45
+def london_signal_window(d: date) -> tuple[int, int]:
+    # 08:00–12:45 heure de Londres → UTC s’ajuste (BST l’été, GMT l’hiver)
+    return session_window_utc(d, "Europe/London", 8, 0, 12, 45)
+
+def ny_signal_window(d: date) -> tuple[int, int]:
+    # 09:00–13:45 heure de New York → UTC s’ajuste (EDT l’été, EST l’hiver)
+    return session_window_utc(d, "America/New_York", 9, 0, 13, 45)
     return start, end
 
 def window_for_session(session: str, d: date) -> Tuple[int, int]:
@@ -532,7 +538,7 @@ def main():
     d1 = parse_date(args.end_date)
 
     # --- TOKYO ONLY ---
-    sessions = ["LONDON"]
+    sessions = ["TOKYO"]
 
     best_rows: List[Dict[str, Any]] = []
 

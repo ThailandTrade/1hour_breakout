@@ -380,7 +380,7 @@ def main():
     # FIXED offset only (default +3 hours)
     ap.add_argument("--server-offset-hours", type=int, default=int(os.getenv("SERVER_OFFSET_HOURS", "3")),
                     help="Fixed server offset hours (e.g., 3 for UTC+3).")
-    ap.add_argument("--pairs-file", default=os.getenv("PAIRS_FILE", "session_pairs.txt"),
+    ap.add_argument("--pairs-file", default=os.getenv("PAIRS_FILE", "pairs.txt"),
                     help="Path to pairs file (CSV with column 'pair').")
     ap.add_argument("--timeframes-file", default=os.getenv("TIMEFRAMES_FILE", "timeframes.txt"),
                     help="Path to timeframes file (list).")

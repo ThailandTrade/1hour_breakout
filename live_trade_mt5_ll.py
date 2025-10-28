@@ -36,7 +36,7 @@ PG_PASS=os.getenv("PG_PASSWORD","postgres"); PG_SSLMODE=os.getenv("PG_SSLMODE","
 
 POLL_SECONDS=int(os.getenv("POLL_SECONDS","15"))
 ENABLE_TRADING=os.getenv("ENABLE_TRADING","true").lower() in ("1","true","yes","y")
-RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.2"))/100.0
+RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.05"))/100.0
 USE_EQUITY_FOR_RISK=os.getenv("USE_EQUITY_FOR_RISK","true").lower() in ("1","true","yes","y")
 COMMENT_TAG=os.getenv("COMMENT_TAG","LIVE_BPULL")
 ALLOWED_DEV_POINTS=int(os.getenv("ALLOWED_DEVIATION_POINTS","20"))
@@ -95,7 +95,7 @@ def tokyo_signal_window(d:date)->Tuple[int,int]:
     return int((base+timedelta(hours=1)).timestamp()*1000), int((base+timedelta(hours=5,minutes=45)).timestamp()*1000)
 def london_signal_window(d:date)->Tuple[int,int]:
     base=datetime(d.year,d.month,d.day,tzinfo=UTC)
-    return int((base+timedelta(hours=9)).timestamp()*1000), int((base+timedelta(hours=13,minutes=45)).timestamp()*1000)
+    return int((base+timedelta(hours=8)).timestamp()*1000), int((base+timedelta(hours=12,minutes=45)).timestamp()*1000)
 def ny_signal_window(d:date)->Tuple[int,int]:
     base=datetime(d.year,d.month,d.day,tzinfo=UTC)
     return int((base+timedelta(hours=13)).timestamp()*1000), int((base+timedelta(hours=17,minutes=45)).timestamp()*1000)

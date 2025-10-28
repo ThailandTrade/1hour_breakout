@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Multi-Pairs — Best (Session × w1,w2,w3) per Pair — Expectancy Recap (1 ligne par paire)
+Multi-Pairs — Best (Session × w1,w2,w3) per Pair — Expectancy Recap (1 line per pair)
++ NEW: Weekday × Session breakdown per pair, with best (weekday, session, weights) summary.
 
-RÈGLE (mise à jour) :
-- On détermine, pour chaque paire, le meilleur moment (session) pour LANCER un trade.
-- Par session (TOKYO/LONDON/NY), on prend AU PLUS 1 trade par (paire, jour) si l'entrée se produit dans la fenêtre de la session.
-- Peu importe quand le trade se termine (SL/RR3), on NE bloque PAS le jour suivant (pas d'anti-overlap cross-day).
+RULE (unchanged core):
+- For each pair, determine the best session to ENTER a trade.
+- Per session (TOKYO/LONDON/NY), take AT MOST 1 trade per (pair, day) if the entry occurs within the session window.
+- Regardless of when the trade closes (SL/RR3), we DO NOT block the following day (no cross-day anti-overlap).
 
-Entrées & cibles (inchangé, sauf SL de l’entrée cf. plus bas) :
-- Entrées: mêmes règles (break strict, pullback antagoniste, entrée wick), SL = extrême (low/high) depuis le pullback (inclus).
-- Cibles: RR1 / RR2 / RR3 (timestamps), arrêt au 1er SL ou RR3 (pour l’évaluation des hits).
-- WIN/LOSS: WIN si TP1 < SL, sinon LOSS (indépendant des poids).
-- R-multiple: application événementielle des partiels (w1,w2,w3), w1+w2+w3=1.
+Entries & targets:
+- Same entry rules (strict break, antagonistic pullback, wick entry), SL = min/max since pullback (inclusive).
+- Targets: RR1 / RR2 / RR3 (timestamps), stop at 1st SL or RR3 (for hit recording).
+- WIN/LOSS: WIN if TP1 < SL, else LOSS (independent from weights).
+- R-multiple: temporal partials (w1,w2,w3), w1+w2+w3=1.
 - Sessions: TOKYO / LONDON / NY.
-- Sortie: tableau final trié par Expectancy (R) — 1 ligne = la meilleure combinaison par paire.
 
-I/O:
-- Lit les paires depuis --pairs-file (default: pairs.txt). Format simple: une paire par ligne,
-  ou CSV avec une colonne "pair"/"pairs". Dédoublonnage automatique.
-- Pas de sizing ni de frais: optimisation pure en R.
+NEW:
+- Per pair, print a Weekday × Session breakdown (best weights per cell) and a "best (weekday, session)" row.
 
 Usage:
   python grid_best_by_pair.py --pairs-file pairs.txt --start-date 2025-01-01 --end-date 2025-12-31
@@ -68,7 +66,7 @@ def day_ms_bounds(d: date) -> Tuple[int, int]:
     end   = start + timedelta(days=1)
     return int(start.timestamp()*1000), int(end.timestamp()*1000)
 
-# ---- Sessions (fenêtres UTC) ----
+# ---- Sessions (UTC windows) ----
 def tokyo_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
     start = int((base + timedelta(hours=1)).timestamp()*1000)                # 01:00
@@ -77,7 +75,7 @@ def tokyo_signal_window(d: date) -> Tuple[int, int]:
 
 def london_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=8)).timestamp()*1000)                # 08:00
+    start = int((base + timedelta(hours=9)).timestamp()*1000)                # 08:00
     end   = int((base + timedelta(hours=12, minutes=45)).timestamp()*1000)  # 12:45
     return start, end
 
@@ -159,7 +157,7 @@ def read_15m_from(conn, pair: str, start_ms: int) -> List[Dict]:
     except Exception:
         conn.rollback(); return []
 
-# ---------------- FSM / Trade (CORE LOGIC — DO NOT CHANGE sauf SL depuis pullback) ----------------
+# ---------------- FSM / Trade ----------------
 @dataclass
 class Trade:
     side: str              # "LONG" | "SHORT"
@@ -168,16 +166,16 @@ class Trade:
     sl: float
 
 def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
-    # Activation long/short + pullback antagoniste + wick trigger; SL = lowest/highest depuis pullback (inclus)
+    # Activation long/short + pullback antagoniste + wick trigger; SL = lowest/highest since pullback (inclusive)
     long_active = False
     long_hh: Optional[float] = None
     long_pullback_idx: Optional[int] = None
-    long_min_low_since_pullback: Optional[float] = None  # suivi du plus bas depuis pullback (inclus)
+    long_min_low_since_pullback: Optional[float] = None
 
     short_active = False
     short_ll: Optional[float] = None
     short_pullback_idx: Optional[int] = None
-    short_max_high_since_pullback: Optional[float] = None  # suivi du plus haut depuis pullback (inclus)
+    short_max_high_since_pullback: Optional[float] = None
 
     for i, b in enumerate(c15):
         ts, o, h, l, c = b["ts"], b["open"], b["high"], b["low"], b["close"]
@@ -199,7 +197,7 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             prev_hh = long_hh
             if long_pullback_idx is None and (c < o):
                 long_pullback_idx = i
-                long_min_low_since_pullback = l  # inclut la bougie de pullback
+                long_min_low_since_pullback = l
             if long_pullback_idx is not None and i >= 1:
                 prev_low = c15[i-1]["low"]
                 long_min_low_since_pullback = prev_low if long_min_low_since_pullback is None else min(long_min_low_since_pullback, prev_low)
@@ -215,7 +213,7 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             prev_ll = short_ll
             if short_pullback_idx is None and (c > o):
                 short_pullback_idx = i
-                short_max_high_since_pullback = h  # inclut la bougie de pullback
+                short_max_high_since_pullback = h
             if short_pullback_idx is not None and i >= 1:
                 prev_high = c15[i-1]["high"]
                 short_max_high_since_pullback = prev_high if short_max_high_since_pullback is None else max(short_max_high_since_pullback, prev_high)
@@ -228,10 +226,10 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
 
     return None
 
-# ---------------- After-entry evaluation (CORE LOGIC — DO NOT CHANGE) ----------------
+# ---------------- After-entry evaluation ----------------
 def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
     """
-    Enregistre les timestamps de RR1/RR2/RR3/SL; stop au premier SL ou RR3.
+    Record timestamps for RR1/RR2/RR3/SL; stop at the first SL or RR3.
     """
     eps = pip_eps_for(pair)
     entry, sl = tr.entry, tr.sl
@@ -283,12 +281,12 @@ def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
 # ---------------- Partials (w1,w2,w3) -> R-multiple ----------------
 def compute_r_and_close(hit_time: Dict[str, Optional[int]], w1: float, w2: float, w3: float) -> float:
     """
-    Application temporelle des sorties partielles (w1+w2+w3=1):
+    Temporal partial exits (w1+w2+w3=1):
       TP1: +w1 * 1R ; rem -= w1
       TP2: +w2 * 2R ; rem -= w2
       TP3: +w3 * 3R ; rem -= w3
       SL : -1R * rem
-    Renvoie le R-multiple total.
+    Returns total R-multiple.
     """
     t_sl = hit_time.get("SL")
     t1   = hit_time.get("RR1")
@@ -331,46 +329,47 @@ def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
     sl = hits.get("SL")
     return t is not None and (sl is None or t < sl)
 
-# ---------------- Core: générer les trades (par session) ----------------
+# ---------------- Core: generate trades (per session) ----------------
 @dataclass
 class BareTrade:
-    hits: Dict[str, Optional[int]]  # {"SL": ts|None, "RR1": ts|None, "RR2": ts|None, "RR3": ts|None}
+    entry_ts: int                                  # NEW: to compute weekday
+    hits: Dict[str, Optional[int]]                 # {"SL": ts|None, "RR1": ts|None, "RR2": ts|None, "RR3": ts|None}
 
 def collect_trades_for_session(conn, pair: str, start: date, end: date, session: str) -> List[BareTrade]:
     """
-    Règle: on prend AU PLUS UN trade par (paire, jour) si l'entrée est dans la fenêtre de la session.
-    Peu importe quand il se ferme (SL/RR3), on ne bloque PAS le jour suivant.
+    Rule: take AT MOST ONE trade per (pair, day) if the entry OPEN timestamp is within the session window.
+    No cross-day blocking.
     """
     trades: List[BareTrade] = []
 
     for d in daterange(start, end):
-        # 1) Range H1 du jour
+        # 1) Day's 1H range
         c1 = read_first_1h(conn, pair, d)
         if not c1:
             continue
         rh, rl = c1["high"], c1["low"]
 
-        # 2) Fenêtre 15m de la session pour ce jour
+        # 2) Session 15m window
         s, e = window_for_session(session, d)
         c15 = read_15m_in(conn, pair, s, e)
         if not c15:
             continue
 
-        # 3) Détecte le PREMIER trade dans la fenêtre (un seul par jour)
+        # 3) First trade within window (one per day)
         tr = detect_first_trade_for_day(c15, rh, rl)
         if not tr:
             continue
 
-        # 4) Enregistre les hits pour calculer R/TP%
+        # 4) Record hits
         _, _, hits, _closed_ts = evaluate_trade_after_entry(conn, pair, tr)
-        trades.append(BareTrade(hits=hits))
+        trades.append(BareTrade(entry_ts=tr.entry_ts, hits=hits))
 
-        # 5) Passe au jour suivant (JAMAIS de 2e trade ce jour pour cette session/paire)
+        # 5) next day
         continue
 
     return trades
 
-# ---------------- Grille des poids ----------------
+# ---------------- Weight grid ----------------
 def weight_grid(step: float = 0.1):
     vals = [round(i*step, 1) for i in range(int(1/step)+1)]
     for w1 in vals:
@@ -381,7 +380,7 @@ def weight_grid(step: float = 0.1):
             if abs(w1 + w2 + w3 - 1.0) <= 1e-9 and (0.0 <= w3 <= 1.0):
                 yield (w1, w2, w3)
 
-# ---------------- Stats pour une combinaison ----------------
+# ---------------- Stats for a weights combo ----------------
 def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float) -> Dict[str, Any]:
     total = len(trades)
     if total == 0:
@@ -400,7 +399,7 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float) 
 
         r_mult = compute_r_and_close(hits, w1, w2, w3)
 
-        # WIN/LOSS = TP1 avant SL
+        # WIN/LOSS = TP1 before SL
         if reached_before(hits, "RR1"):
             r_wins.append(r_mult)
         else:
@@ -419,13 +418,13 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float) 
 
     return {"trades": total, "winrate": winrate, "avg_win": avg_win, "avg_loss": avg_loss, "exp": expectancy, "p1": p1, "p2": p2, "p3": p3}
 
-# ---------------- Chargement des paires ----------------
+# ---------------- Load pairs ----------------
 def load_pairs_from_file(path: str) -> List[str]:
     pairs: List[str] = []
     if not os.path.exists(path):
-        print(f"Erreur: {path} introuvable.")
+        print(f"Error: {path} not found.")
         return pairs
-    # Essaye CSV avec en-tête
+    # Try CSV header first
     try:
         with open(path, "r", newline="") as f:
             reader = csv.DictReader(f)
@@ -440,7 +439,7 @@ def load_pairs_from_file(path: str) -> List[str]:
                     return pairs
     except Exception:
         pass
-    # Fallback: une paire par ligne
+    # Fallback: one pair per line
     with open(path, "r") as f:
         for line in f:
             p = line.strip()
@@ -451,14 +450,13 @@ def load_pairs_from_file(path: str) -> List[str]:
                 pairs.append(up)
     return pairs
 
-# ---------------- Impression du recap final (1 ligne / paire) ----------------
+# ---------------- Pretty printers ----------------
 def print_final_best_table(rows: List[Dict[str, Any]]):
     try:
         from prettytable import PrettyTable
     except Exception:
         PrettyTable = None
 
-    # Tri par expectancy décroissante
     rows_sorted = sorted(rows, key=lambda r: r["exp"], reverse=True)
 
     if PrettyTable:
@@ -470,8 +468,7 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
         ]
         for r in rows_sorted:
             t.add_row([
-                r["pair"],
-                r["session"],
+                r["pair"], r["session"],
                 f"{r['w1']:.1f}", f"{r['w2']:.1f}", f"{r['w3']:.1f}",
                 r["trades"],
                 f"{r['winrate']*100:.2f}%",
@@ -482,11 +479,10 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
                 f"{r['p2']*100:.2f}%",
                 f"{r['p3']*100:.2f}%"
             ])
-        print("\n===== BEST COMBO PAR PAIRE — trié par Expectancy (R) =====")
+        print("\n===== BEST COMBO PER PAIR — sorted by Expectancy (R) =====")
         print(t)
         print("==========================================================")
     else:
-        # Fallback
         print("\nPair\tSession\tw1\tw2\tw3\tTrades\tWinrate\tAvgWinR\tAvgLossR\tExpectancyR\tTP1%\tTP2%\tTP3%")
         for r in rows_sorted:
             print("\t".join([
@@ -503,18 +499,102 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
             ]))
         print("==========================================================")
 
+def print_weekday_session_breakdown(pair: str, rows: List[Dict[str, Any]]):
+    """
+    rows: list of dicts each containing:
+      pair, weekday (0=Mon..6=Sun), weekday_name, session, w1,w2,w3, trades, winrate, avg_win, avg_loss, exp, p1,p2,p3
+    Prints full matrix and best row for that pair.
+    """
+    try:
+        from prettytable import PrettyTable
+    except Exception:
+        PrettyTable = None
+
+    # Determine best (weekday, session)
+    best = None
+    for r in rows:
+        if best is None or r["exp"] > best["exp"]:
+            best = r
+
+    # Pretty print matrix rows (only those with trades>0)
+    rows_with_trades = [r for r in rows if r["trades"] > 0]
+    if PrettyTable and rows_with_trades:
+        t = PrettyTable()
+        t.field_names = [
+            "Pair","Weekday","Session","w1","w2","w3",
+            "Trades","Winrate","AvgWinR","AvgLossR","ExpectancyR",
+            "TP1%","TP2%","TP3%"
+        ]
+        for r in sorted(rows_with_trades, key=lambda x: (x["weekday"], x["session"], -x["exp"])):
+            t.add_row([
+                r["pair"], r["weekday_name"], r["session"],
+                f"{r['w1']:.1f}", f"{r['w2']:.1f}", f"{r['w3']:.1f}",
+                r["trades"],
+                f"{r['winrate']*100:.2f}%",
+                f"{r['avg_win']:.3f}R",
+                f"{r['avg_loss']:.3f}R",
+                f"{r['exp']:+.3f}R",
+                f"{r['p1']*100:.2f}%",
+                f"{r['p2']*100:.2f}%",
+                f"{r['p3']*100:.2f}%"
+            ])
+        print(f"\n===== WEEKDAY × SESSION BREAKDOWN — {pair} =====")
+        print(t)
+        print("================================================")
+
+    # Best-of summary (even if no trades: print neutral)
+    if best and best["trades"] > 0:
+        print(f"BEST (weekday × session) for {pair}: {best['weekday_name']} / {best['session']} "
+              f"with weights (w1={best['w1']:.1f}, w2={best['w2']:.1f}, w3={best['w3']:.1f}) "
+              f"→ Expectancy {best['exp']:+.3f}R over {best['trades']} trades.")
+    else:
+        print(f"BEST (weekday × session) for {pair}: no trades in range.")
+
+# ---------------- NEW: compute weekday×session breakdown ----------------
+WEEKDAY_NAMES = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
+
+def weekday_session_breakdown_for_pair(session_trades: Dict[str, List[BareTrade]], step: float) -> List[Dict[str, Any]]:
+    """
+    For each weekday (0..6) and session, filter trades whose ENTRY OPEN is on that weekday.
+    For each filtered set, search best (w1,w2,w3) by expectancy and return a row.
+    """
+    rows: List[Dict[str, Any]] = []
+    sessions = ["TOKYO", "LONDON", "NY"]
+
+    for wd in range(7):
+        for sess in sessions:
+            trades = [bt for bt in session_trades.get(sess, []) if datetime.fromtimestamp(bt.entry_ts/1000, tz=UTC).weekday() == wd]
+            best_row = {
+                "pair": None, "weekday": wd, "weekday_name": WEEKDAY_NAMES[wd], "session": sess,
+                "w1": 0.0, "w2": 0.0, "w3": 1.0,
+                "trades": 0, "winrate": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "exp": 0.0,
+                "p1": 0.0, "p2": 0.0, "p3": 0.0
+            }
+            # Grid search for this wd×session
+            for (w1, w2, w3) in weight_grid(step=step):
+                st = stats_for_weights(trades, w1, w2, w3)
+                row = {
+                    **best_row,
+                    "w1": w1, "w2": w2, "w3": w3,
+                    **st
+                }
+                if (row["trades"] > 0) and (row["exp"] > best_row["exp"]):
+                    best_row = row
+            rows.append(best_row)
+    return rows
+
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pairs-file", default="pairs.txt", help="Fichier des paires (une par ligne ou CSV avec colonne pair/pairs)")
+    ap.add_argument("--pairs-file", default="pairs.txt", help="Pairs file (one per line or CSV with column pair/pairs)")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date",   default="2025-12-31")
-    ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Pas de grille (fixé à 0.1)")
+    ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Grid step (fixed to 0.1)")
     args = ap.parse_args()
 
     pairs = load_pairs_from_file(args.pairs_file)
     if not pairs:
-        print("Aucune paire trouvée.")
+        print("No pairs found.")
         sys.exit(0)
 
     d0 = parse_date(args.start_date)
@@ -529,15 +609,14 @@ def main():
             if not pair:
                 continue
 
-            # 1) Collecte des trades par session (une seule fois)
+            # 1) Collect trades per session (one pass)
             session_trades: Dict[str, List[BareTrade]] = {}
             for sess in sessions:
-                print(f"[{pair}] Collecte trades — {sess} ...")
+                print(f"[{pair}] Collecting trades — {sess} ...")
                 session_trades[sess] = collect_trades_for_session(c, pair, d0, d1, sess)
 
-            # 2) Parcourt la grille (w1,w2,w3) pour chaque session et retient la meilleure combinaison
+            # 2) Best overall (session × weights) per pair
             best_for_pair: Optional[Dict[str, Any]] = None
-
             for sess in sessions:
                 trades = session_trades[sess]
                 for (w1, w2, w3) in weight_grid(step=args.step):
@@ -551,11 +630,9 @@ def main():
                     if (best_for_pair is None) or (row["exp"] > best_for_pair["exp"]):
                         best_for_pair = row
 
-            # 3) Empile la meilleure ligne de la paire si au moins 1 trade
             if best_for_pair and best_for_pair["trades"] > 0:
                 best_rows.append(best_for_pair)
             else:
-                # Ajoute quand même une ligne neutre pour visibilité
                 best_rows.append({
                     "pair": pair, "session": "-",
                     "w1": 0.0, "w2": 0.0, "w3": 1.0,
@@ -563,7 +640,14 @@ def main():
                     "p1": 0.0, "p2": 0.0, "p3": 0.0
                 })
 
-    # 4) Affichage final (1 ligne par paire)
+            # 3) NEW: Weekday × Session breakdown for this pair
+            wd_rows = weekday_session_breakdown_for_pair(session_trades, step=args.step)
+            # attach pair name and print
+            for r in wd_rows:
+                r["pair"] = pair
+            print_weekday_session_breakdown(pair, wd_rows)
+
+    # 4) Final overall best (1 line per pair)
     print_final_best_table(best_rows)
 
 if __name__ == "__main__":
