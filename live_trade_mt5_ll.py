@@ -17,7 +17,7 @@ Logic:
 - One row per (pair, date); Status: READY, TRIGGERED, WIN, LOSS, CANCELLED
 """
 
-import os, sys, time, csv, traceback
+import os, sys, time, csv, traceback, random
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -44,6 +44,10 @@ BROKER_MIN_DIST_BUF_PTS=int(os.getenv("BROKER_MIN_DISTANCE_BUFFER_POINTS","0"))
 MAX_LEVERAGE=float(os.getenv("MAX_LEVERAGE","10"))
 MIN_READY_PIPS=float(os.getenv("MIN_READY_PIPS","0"))
 FEE_PER_LOT=float(os.getenv("FEE_PER_LOT","2.5"))
+
+# --- NEW: throttle tuning via env ---
+ORDER_THROTTLE_MIN_S=int(os.getenv("ORDER_THROTTLE_MIN_SECONDS","10"))
+ORDER_THROTTLE_MAX_S=int(os.getenv("ORDER_THROTTLE_MAX_SECONDS","30"))
 
 MT5_TERMINAL_PATH=os.getenv("MT5_TERMINAL_PATH")
 MT5_LOGIN=os.getenv("MT5_LOGIN"); MT5_PASSWORD=os.getenv("MT5_PASSWORD"); MT5_SERVER=os.getenv("MT5_SERVER")
@@ -462,6 +466,21 @@ def ensure_stop_type_and_distances(symbol:str, side:str, entry:float, sl:float, 
             if (entry-tp)/p<min_pts: tp=round(entry-(min_pts*p),si.digits)
     return (round(entry,si.digits),round(sl,si.digits),round(tp,si.digits),order_type)
 
+# ---- NEW: simple per-loop throttle state ----
+_SENDS_THIS_LOOP = 0
+def _throttle_before_send(kind:str, symbol:str):
+    """Sleep randomly (10–30s by default) if this loop already sent something."""
+    global _SENDS_THIS_LOOP
+    if _SENDS_THIS_LOOP > 0:
+        d = random.uniform(ORDER_THROTTLE_MIN_S, ORDER_THROTTLE_MAX_S)
+        L(f"[MT5] Throttle ({kind} {symbol}): sleeping {d:.1f}s")
+        time.sleep(d)
+
+def _count_send():
+    global _SENDS_THIS_LOOP
+    _SENDS_THIS_LOOP += 1
+# ---- end NEW ----
+
 def place_stop_order(symbol:str, side:str, entry:float, sl:float, tp:float)->Tuple[bool,Optional[int],Optional[int],str,Optional[float]]:
     if not mt5_preflight(symbol): return (False,None,None,"preflight",None)
     entry,sl,tp,otype=ensure_stop_type_and_distances(symbol,side,entry,sl,tp)
@@ -476,7 +495,12 @@ def place_stop_order(symbol:str, side:str, entry:float, sl:float, tp:float)->Tup
         "deviation": ALLOWED_DEV_POINTS, "comment": COMMENT_TAG,
         "type_time": mt5.ORDER_TIME_GTC
     }
+
+    # NEW: throttle before placing a new order
+    _throttle_before_send("PLACE", symbol)
     res=mt5.order_send(req)
+    _count_send()  # NEW: count this send
+
     if res is None or res.retcode!=mt5.TRADE_RETCODE_DONE:
         L(f"[MT5] order_send failed: {None if res is None else res.retcode} / {None if res is None else res.comment}")
         return (False,None,None,"send_fail" if res else "send_none",None)
@@ -484,15 +508,20 @@ def place_stop_order(symbol:str, side:str, entry:float, sl:float, tp:float)->Tup
     return (True,int(res.order),int(res.request_id),otype,float(lots))
 
 def modify_stop_order(order_id:int, new_price:Optional[float], new_sl:Optional[float], new_tp:Optional[float])->bool:
-    os=mt5.orders_get(ticket=order_id)
-    if not os: return False
-    o=os[0]; si=mt5.symbol_info(o.symbol)
+    os_ = mt5.orders_get(ticket=order_id)
+    if not os_: return False
+    o=os_[0]; si=mt5.symbol_info(o.symbol)
     req={"action": mt5.TRADE_ACTION_MODIFY, "order": order_id, "symbol": o.symbol,
          "price": o.price_open if new_price is None else round(new_price,si.digits),
          "sl": o.sl if new_sl is None else round(new_sl,si.digits),
          "tp": o.tp if new_tp is None else round(new_tp,si.digits),
          "comment": COMMENT_TAG}
+
+    # NEW: throttle before modify
+    _throttle_before_send("MODIFY", o.symbol)
     r=mt5.order_send(req)
+    _count_send()  # NEW: count this send
+
     ok=(r is not None and r.retcode==mt5.TRADE_RETCODE_DONE)
     if ok: L(f"[MT5] MODIFIED order={order_id} price={req['price']} SL={req['sl']} TP={req['tp']}")
     return ok
@@ -501,10 +530,11 @@ def cancel_pending_mt5_order_if_any(conn,pair:str,d:date):
     row=fetch_core(conn,pair,d)
     if not row or not row.get("mt5_order_id"): return
     oid=int(row["mt5_order_id"])
-    os=mt5.orders_get(ticket=oid)
-    if os:
-        o=os[0]
+    os_=mt5.orders_get(ticket=oid)
+    if os_:
+        o=os_[0]
         req={"action":mt5.TRADE_ACTION_REMOVE,"order":oid,"symbol":o.symbol,"comment":COMMENT_TAG}
+        # NOTE: cancellations are NOT throttled on purpose
         r=mt5.order_send(req)
         if r is None or r.retcode!=mt5.TRADE_RETCODE_DONE:
             L(f"[MT5] cancel failed {None if r is None else r.retcode}")
@@ -516,6 +546,7 @@ def cancel_pending_mt5_order_if_any(conn,pair:str,d:date):
                         WHERE pair=%s AND trade_date=%s""",(pair,d)); conn.commit()
 
 def replace_pending_order_with(conn, pair:str, side:str, entry:float, sl:float, tp:float, today:date):
+    # cancel (not throttled), then place (throttled inside place_stop_order)
     cancel_pending_mt5_order_if_any(conn, pair, today)
     ok, oid, reqid, otype, lots = place_stop_order(pair, side, entry, sl, tp)
     with conn.cursor() as cur:
@@ -683,19 +714,19 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
 
             if new_lots is None or new_lots <= 0:
                 if oid:
-                    modify_stop_order(int(oid), entry_r, sl_r, tp_r)
+                    modify_stop_order(int(oid), entry_r, sl_r, tp_r)  # throttled
                 return
 
             if not oid:
-                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)
+                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)  # throttled (via place)
                 return
 
             si = mt5.symbol_info(pair); step = float(si.volume_step) if si else 0.01
             same_volume = abs(new_lots - prev_lots) < (step/2.0)
             if same_volume:
-                modify_stop_order(int(oid), entry_r, sl_r, tp_r)
+                modify_stop_order(int(oid), entry_r, sl_r, tp_r)  # throttled
             else:
-                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)
+                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)  # throttled (via place)
 
     # state
     row = fetch_core(conn, pair, today)
@@ -761,7 +792,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         if st in ("TRIGGERED","WIN","LOSS","CANCELLED"):
             bump_last_processed(conn, pair, today, ts); continue
 
-        # --- Phase A: NOT READY (tracking) — update entry to new trend extreme; update SL only if bar extends vs current SL
+        # --- Phase A: NOT READY (tracking)
         if st is None or st == "":
             if side == "LONG":
                 if (entry_base is None) or (h > entry_base): entry_base = h
@@ -774,7 +805,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
 
             update_base_entry_sl(entry_base, sl_base)
 
-            # pullback? apply same update first (already done), then freeze to READY
+            # pullback? then freeze to READY
             if antagonistic(o, c, side):
                 entry_frozen = round_price(pair, entry_base)
                 sl_start     = round_price(pair, sl_base)
@@ -849,6 +880,10 @@ def main():
             if ENABLE_TRADING and MT5_ENABLED: mt5_initialize()
             while True:
                 try:
+                    # NEW: reset per-loop throttle counter
+                    global _SENDS_THIS_LOOP
+                    _SENDS_THIS_LOOP = 0
+
                     tuples=load_session_file()
                     if not tuples:
                         L("[ERR] no valid rows in session file")
