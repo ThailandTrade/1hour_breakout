@@ -829,11 +829,17 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     # End of window: cancel if nothing triggered
     row_end = fetch_core(conn, pair, today)
     st_end = (row_end["status"] or "").upper() if row_end and row_end["status"] else None
+
+    # fenêtre considérée close quand la dernière 15m dispo + 15 min >= e_ms
     if (latest_15m_open_ts_for_pair(conn, pair) or 0) + FIFTEEN_MS >= e_ms:
-        if not is_terminal(st_end):
+        # cas 1 : jamais déclenché -> on nettoie et on marque CANCELLED
+        if st_end in (None, "", "READY"):
             if ENABLE_TRADING and MT5_ENABLED and mt5_initialize():
                 cancel_pending_mt5_order_if_any(conn, pair, today)
             mark_outcome(conn, pair, today, e_ms, "CANCELLED")
+        # cas 2 : TRIGGERED -> NE RIEN FAIRE (on laisse MT5 décider WIN/LOSS)
+        # cas 3 : terminal (WIN/LOSS/CANCELLED) -> NE RIEN FAIRE
+        return
         return
 
 # ---------- Main loop ----------
