@@ -840,7 +840,6 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         # cas 2 : TRIGGERED -> NE RIEN FAIRE (on laisse MT5 décider WIN/LOSS)
         # cas 3 : terminal (WIN/LOSS/CANCELLED) -> NE RIEN FAIRE
         return
-        return
 
 # ---------- Main loop ----------
 def main():
