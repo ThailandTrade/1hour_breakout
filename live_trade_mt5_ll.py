@@ -374,6 +374,31 @@ def round_volume(vol:float,symbol:str)->float:
     steps=int(vol/step); v=max(vmin, min(steps*step, vmax))
     return round(v, 3)
 
+# ---- NEW small helpers (used ONLY by the fallback sizing) ----
+def _ccy_mid(symbol: str) -> Optional[float]:
+    s = mt5.symbol_info(symbol)
+    t = mt5.symbol_info_tick(symbol) if s else None
+    if not (s and t): return None
+    b = float(getattr(t, "bid", 0.0) or 0.0)
+    a = float(getattr(t, "ask", 0.0) or 0.0)
+    if b > 0 and a > 0: return (b + a) / 2.0
+    last = float(getattr(t, "last", 0.0) or 0.0)
+    return last if last > 0 else None
+
+def _fx_rate(ccy_from: str, ccy_to: str) -> Optional[float]:
+    # returns how many units of ccy_to for 1 unit of ccy_from
+    ccy_from = (ccy_from or "USD").upper()
+    ccy_to = (ccy_to or "USD").upper()
+    if ccy_from == ccy_to: return 1.0
+    direct = ccy_to + ccy_from   # e.g., USDCHF to convert CHF->USD
+    r = _ccy_mid(direct)
+    if r and r > 0: return r
+    inv = ccy_from + ccy_to      # e.g., CHFUSD
+    r = _ccy_mid(inv)
+    if r and r > 0: return 1.0 / r
+    return None
+# ---- end NEW helpers ----
+
 def calc_lots(symbol:str, risk_frac:float, entry:float, sl:float)->Optional[float]:
     ai=mt5.account_info()
     if not ai: return None
@@ -381,14 +406,36 @@ def calc_lots(symbol:str, risk_frac:float, entry:float, sl:float)->Optional[floa
     capital = equity if USE_EQUITY_FOR_RISK else float(ai.margin_free)
     risk_per_lot=_risk_usd_per_lot(symbol,entry,sl)
     if not risk_per_lot or risk_per_lot<=0:
-        pipsz=pip_size_for(symbol)
-        pv= (mt5.symbol_info(symbol).trade_contract_size or 100000.0) * pipsz
-        if symbol.upper().endswith("JPY"):
-            mid = (mt5.symbol_info_tick(symbol).bid + mt5.symbol_info_tick(symbol).ask)/2.0
-            pv = pv/max(mid,1e-9)
-        sl_pips=abs(entry-sl)/max(pipsz,1e-12)
-        if sl_pips<=0: return None
-        risk_per_lot = pv*sl_pips
+        # --- MODIFIED fallback: convert QUOTE -> account currency ---
+        si = mt5.symbol_info(symbol); 
+        if not si: return None
+        acct_ccy = str(getattr(ai, "currency", "USD") or "USD").upper()
+        base = symbol[:3].upper()
+        quote = symbol[3:6].upper()
+
+        pipsz = pip_size_for(symbol)
+        contract = float(si.trade_contract_size or 100000.0)
+
+        # pip value per lot in QUOTE currency
+        pip_value_quote = contract * pipsz
+
+        # SL distance in pips
+        sl_pips = abs(entry - sl) / max(pipsz, 1e-12)
+        if sl_pips <= 0: 
+            return None
+
+        # convert QUOTE -> account currency
+        if quote != acct_ccy:
+            rate = _fx_rate(quote, acct_ccy)  # 1 QUOTE => ? acct_ccy
+            if not rate or rate <= 0: 
+                return None
+            pip_value_acct = pip_value_quote * rate
+        else:
+            pip_value_acct = pip_value_quote
+
+        risk_per_lot = pip_value_acct * sl_pips
+        # --- end MODIFIED fallback ---
+
     lots_risk = max(0.0, capital*risk_frac)/risk_per_lot
     notion_per_lot=_notional_usd_per_lot(symbol) or 0.0
     lots_lev = (equity*MAX_LEVERAGE)/notion_per_lot if notion_per_lot>0 else lots_risk
