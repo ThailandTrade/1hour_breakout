@@ -792,13 +792,51 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         if st in ("TRIGGERED","WIN","LOSS","CANCELLED"):
             bump_last_processed(conn, pair, today, ts); continue
 
-        # --- Phase A: NOT READY (tracking, post-break & pre-pullback)
+        # --- Phase A: NOT READY (tracking)
         if st is None or st == "":
-            # 1) Si bougie antagoniste => pullback: on fige en READY (logique inchangée)
+            if side == "LONG":
+                # Si la bougie continue le mouvement haussier, on met à jour entry et SL
+                if h > (entry_base or -1e9):
+                    entry_base = h
+                    sl_base = l  # trailing SL sur le low de cette bougie
+                else:
+                    # sinon, comportement normal (mise à jour si plus bas que SL actuel)
+                    new_sl = should_update_sl("LONG", sl_base, l, h)
+                    if new_sl is not None:
+                        sl_base = new_sl
+
+            else:  # SHORT
+                # Si la bougie continue le mouvement baissier, on met à jour entry et SL
+                if l < (entry_base or 1e9):
+                    entry_base = l
+                    sl_base = h  # trailing SL sur le high de cette bougie
+                else:
+                    new_sl = should_update_sl("SHORT", sl_base, l, h)
+                    if new_sl is not None:
+                        sl_base = new_sl
+
+            update_base_entry_sl(entry_base, sl_base)
+
+            # pullback? then freeze to READY
             if antagonistic(o, c, side):
                 entry_frozen = round_price(pair, entry_base)
-                sl_start     = round_price(pair, sl_base)
-                tp_r         = round_price(pair, compute_tp(entry_frozen, sl_start, side, row_cur["tp_level"]))
+
+                # IMPORTANT: sur la bougie de pullback, on ne "dégrade"
+                # le SL que selon la règle demandée (comparé au SL en DB avant cette bougie = cur_sl).
+                if side == "LONG":
+                    # Only lower it if new candidate is LOWER than DB SL
+                    if cur_sl is not None:
+                        sl_start = round_price(pair, min(sl_base, cur_sl))
+                    else:
+                        sl_start = round_price(pair, sl_base)
+                else:
+                    # SHORT: Only raise it if new candidate is HIGHER than DB SL
+                    if cur_sl is not None:
+                        sl_start = round_price(pair, max(sl_base, cur_sl))
+                    else:
+                        sl_start = round_price(pair, sl_base)
+
+                tp_r = round_price(pair, compute_tp(entry_frozen, sl_start, side, row_cur["tp_level"]))
 
                 mark_pullback(conn, pair, today, ts, float(sl_start), float(entry_frozen), float(sl_start), float(tp_r))
 
@@ -809,26 +847,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                                         mt5_order_type=%s,order_status=%s,updated_at=NOW()
                                         WHERE pair=%s AND trade_date=%s""",
                                     (RISK_PERCENT, lots, oid, reqid, otype, ("PLACED" if ok else "REJECTED"), pair, today)); conn.commit()
-                bump_last_processed(conn, pair, today, ts)
-                continue
-
-            # 2) Même sens que le break: on déplace entry ET on fixe le SL EXACTEMENT sur l'autre extrémité de CETTE bougie
-            if side == "LONG":
-                # Nouvelle extension haussière -> entry = high de la bougie ; SL = low de la même bougie (pas de max)
-                if entry_base is None or h > entry_base:
-                    entry_base = h
-                    sl_base    = l
-            else:  # SHORT
-                # Nouvelle extension baissière -> entry = low de la bougie ; SL = high de la même bougie (pas de min)
-                if entry_base is None or l < entry_base:
-                    entry_base = l
-                    sl_base    = h
-
-            # Persiste la base (entry/sl) tant qu'on n'est pas READY
-            update_base_entry_sl(entry_base, sl_base)
-            bump_last_processed(conn, pair, today, ts)
-            continue
-
+                bump_last_processed(conn, pair, today, ts); continue
 
         # --- Phase B: READY — trail SL only if bar extends vs current SL
         if st == "READY":
