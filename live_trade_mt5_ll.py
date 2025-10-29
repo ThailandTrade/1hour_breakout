@@ -671,6 +671,30 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     if is_terminal((row["status"] or "").upper() if row and row["status"] else None):
         return
 
+    # --- NEW: if another day still has an open TRIGGERED trade for this pair, cancel today's line
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT 1
+            FROM {live_tbl()}
+            WHERE pair=%s
+              AND trade_date <> %s
+              AND status = 'TRIGGERED'
+              AND closed_at IS NULL
+            LIMIT 1
+        """, (pair, today))
+        _has_open_other_day = cur.fetchone() is not None
+    if _has_open_other_day:
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                UPDATE {live_tbl()}
+                SET status='CANCELLED',
+                    closed_at=NOW(),
+                    updated_at=NOW()
+                WHERE pair=%s AND trade_date=%s
+            """, (pair, today))
+            conn.commit()
+        return
+
     s_ms, e_ms = session_signal_window(session, today)
 
     if not row["range_1h_at"]:
