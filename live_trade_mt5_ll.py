@@ -792,20 +792,9 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         if st in ("TRIGGERED","WIN","LOSS","CANCELLED"):
             bump_last_processed(conn, pair, today, ts); continue
 
-        # --- Phase A: NOT READY (tracking)
+        # --- Phase A: NOT READY (tracking, post-break & pre-pullback)
         if st is None or st == "":
-            if side == "LONG":
-                if (entry_base is None) or (h > entry_base): entry_base = h
-                new_sl = should_update_sl("LONG", sl_base, l, h)
-                if new_sl is not None: sl_base = new_sl
-            else:
-                if (entry_base is None) or (l < entry_base): entry_base = l
-                new_sl = should_update_sl("SHORT", sl_base, l, h)
-                if new_sl is not None: sl_base = new_sl
-
-            update_base_entry_sl(entry_base, sl_base)
-
-            # pullback? then freeze to READY
+            # 1) Si bougie antagoniste => pullback: on fige en READY (logique inchangée)
             if antagonistic(o, c, side):
                 entry_frozen = round_price(pair, entry_base)
                 sl_start     = round_price(pair, sl_base)
@@ -820,7 +809,26 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                                         mt5_order_type=%s,order_status=%s,updated_at=NOW()
                                         WHERE pair=%s AND trade_date=%s""",
                                     (RISK_PERCENT, lots, oid, reqid, otype, ("PLACED" if ok else "REJECTED"), pair, today)); conn.commit()
-                bump_last_processed(conn, pair, today, ts); continue
+                bump_last_processed(conn, pair, today, ts)
+                continue
+
+            # 2) Même sens que le break: on déplace entry ET on fixe le SL EXACTEMENT sur l'autre extrémité de CETTE bougie
+            if side == "LONG":
+                # Nouvelle extension haussière -> entry = high de la bougie ; SL = low de la même bougie (pas de max)
+                if entry_base is None or h > entry_base:
+                    entry_base = h
+                    sl_base    = l
+            else:  # SHORT
+                # Nouvelle extension baissière -> entry = low de la bougie ; SL = high de la même bougie (pas de min)
+                if entry_base is None or l < entry_base:
+                    entry_base = l
+                    sl_base    = h
+
+            # Persiste la base (entry/sl) tant qu'on n'est pas READY
+            update_base_entry_sl(entry_base, sl_base)
+            bump_last_processed(conn, pair, today, ts)
+            continue
+
 
         # --- Phase B: READY — trail SL only if bar extends vs current SL
         if st == "READY":

@@ -35,7 +35,7 @@ SHOW_TRADES       = True    # Afficher la table des trades clos
 SHOW_MONTHLY      = True    # Afficher le breakdown mensuel
 SHOW_WEEKDAYS     = True    # Afficher le breakdown par jour de la semaine
 SHOW_OPEN_TRADES  = True    # Afficher aussi les trades encore ouverts (mark-to-market)
-SHOW_OPEN_SETUPS  = True    # Afficher les setups break+pullback prêts sans wick
+SHOW_OPEN_SETUPS  = False    # Afficher les setups break+pullback prêts sans wick
 
 # ---------- PARAMÈTRES ----------
 # Skip a trade if stop size < MIN_STOP_PIPS (consumes the session/pair/day anyway)
