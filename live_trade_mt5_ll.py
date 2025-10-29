@@ -646,6 +646,23 @@ def reconcile_with_mt5(conn, pair:str, today:date):
                 cur.execute(f"""UPDATE {live_tbl()} SET order_status='CANCELLED', updated_at=NOW()
                                 WHERE pair=%s AND trade_date=%s""",(pair,today)); conn.commit()
 
+            # >>> NEW: si la fenêtre est finie (ou finissable via la dernière 15m), on aligne aussi "status"
+            try:
+                sess = (row.get("session") or "NY").upper()
+                s_ms, e_ms = session_signal_window(sess, today)
+                last_15m = latest_15m_open_ts_for_pair(conn, pair) or 0
+                now_ms = int(datetime.now(tz=UTC).timestamp()*1000)
+
+                window_is_over = (now_ms >= e_ms) or (last_15m + FIFTEEN_MS >= e_ms)
+                if window_is_over:
+                    # sécurité: on s'assure qu'aucun pending ne reste côté MT5
+                    cancel_pending_mt5_order_if_any(conn, pair, today)
+                    # on aligne la colonne "status" du modèle
+                    mark_outcome(conn, pair, today, e_ms, "CANCELLED")
+            except Exception:
+                traceback.print_exc()
+
+
 # ---------- Core ----------
 def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     upsert_base_row(conn, pair, today, session, tp_level)
