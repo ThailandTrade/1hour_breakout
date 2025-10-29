@@ -917,6 +917,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         return
 
 # ---------- Main loop ----------
+# ---------- Main loop ----------
 def main():
     try:
         with get_pg_conn() as conn:
@@ -928,34 +929,45 @@ def main():
                     global _SENDS_THIS_LOOP
                     _SENDS_THIS_LOOP = 0
 
-                    tuples=load_session_file()
+                    tuples = load_session_file()
                     if not tuples:
                         L("[ERR] no valid rows in session file")
                         time.sleep(POLL_SECONDS); continue
-                    now=datetime.now(tz=UTC); today=now.date()
-                    now_ms=int(now.timestamp()*1000)
-                    for sess,pair,tp,allowed in tuples:
-                        if not allowed.get(today.weekday(), False): 
+
+                    now = datetime.now(tz=UTC); today = now.date()
+                    now_ms = int(now.timestamp()*1000)
+
+                    for sess, pair, tp, allowed in tuples:
+                        if not allowed.get(today.weekday(), False):
                             continue
 
+                        # --- NEW: réconcilier aussi les jours précédents (positions encore ouvertes)
+                        for delta in range(0, 3):  # today, today-1, today-2
+                            d = today - timedelta(days=delta)
+                            try:
+                                reconcile_with_mt5(conn, pair, d)
+                            except Exception as e:
+                                L(f"[MT5-RECONCILE-ERR] {pair} d={d}: {e}")
+                                traceback.print_exc()
+
+                        # --- process_pair UNIQUEMENT pour aujourd'hui (logique intra-fenêtre)
+                        s_ms, e_ms = session_signal_window(sess, today)
+                        if not (s_ms <= now_ms < e_ms + FIFTEEN_MS):
+                            continue
                         try:
-                            reconcile_with_mt5(conn, pair, today)
+                            process_pair(conn, sess, pair, tp, today)
                         except Exception as e:
-                            L(f"[MT5-RECONCILE-ERR] {pair}: {e}")
+                            L(f"[PROC-ERR] {pair}: {e}")
                             traceback.print_exc()
 
-                        s_ms,e_ms=session_signal_window(sess,today)
-                        if not (s_ms <= now_ms < e_ms + FIFTEEN_MS): 
-                            continue
-                        try:
-                            process_pair(conn,sess,pair,tp,today)
-                        except Exception as e:
-                            L(f"[PROC-ERR] {pair}: {e}"); traceback.print_exc()
                 except Exception as e:
-                    L(f"[LOOP-ERR] {e}"); traceback.print_exc()
+                    L(f"[LOOP-ERR] {e}")
+                    traceback.print_exc()
                 time.sleep(POLL_SECONDS)
     except Exception as e:
-        L(f"[FATAL] {e}"); traceback.print_exc()
+        L(f"[FATAL] {e}")
+        traceback.print_exc()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
+
