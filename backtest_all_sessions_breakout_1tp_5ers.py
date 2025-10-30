@@ -33,7 +33,7 @@ import psycopg2
 from psycopg2 import extensions as pg_ext
 
 # ---------- TOGGLES ----------
-SHOW_TRADES   = True    # Afficher la table des trades
+SHOW_TRADES   = False    # Afficher la table des trades
 SHOW_MONTHLY  = True    # Afficher le breakdown mensuel
 SHOW_WEEKDAYS = True    # Afficher le breakdown par jour de la semaine
 

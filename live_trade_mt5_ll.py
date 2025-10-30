@@ -148,7 +148,7 @@ def _class_spec(symbol:str)->Dict[str,float]:
 
 # ---------- Sessions file ----------
 def _yes(x:str)->bool: return (x or "").strip().upper().startswith("Y")
-def load_session_file(path="session_pairs.txt")->List[Tuple[str,str,str,Dict[int,bool]]]:
+def load_session_file(path="session_pairs_5ers.txt")->List[Tuple[str,str,str,Dict[int,bool]]]:
     out=[]
     if not os.path.exists(path):
         L(f"[ERR] session file '{path}' not found"); return out
