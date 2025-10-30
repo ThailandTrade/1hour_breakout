@@ -517,7 +517,7 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pairs-file", default="pairs.txt", help="Fichier des paires (une par ligne ou CSV avec colonne pair/pairs)")
+    ap.add_argument("--pairs-file", default="pairs_5ers.txt", help="Fichier des paires (une par ligne ou CSV avec colonne pair/pairs)")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date",   default="2025-12-31")
     ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Pas de grille (fixé à 0.1)")

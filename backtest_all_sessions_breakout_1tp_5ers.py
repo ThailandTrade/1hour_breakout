@@ -122,16 +122,136 @@ def table_name(pair: str, tf: str) -> str:
 def pip_eps_for(pair: str) -> float:
     return 0.001 if pair.upper().endswith("JPY") else 0.00001
 
+# =====================  CHANGES START: multi-asset sizing  =====================
+
+def instrument_type_for(symbol: str) -> str:
+    """Return one of: FOREX | METAL | INDEX | CRYPTO."""
+    s = (symbol or "").upper()
+    if s in ("XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"):
+        return "METAL"
+    if any(s.startswith(p) for p in ("US30", "US500", "SP500", "NAS100", "DAX40", "GER40", "UK100", "FRA40", "JP225", "JPN225", "HK50", "AUS200", "ES35", "IT40", "CN50")):
+        return "INDEX"
+    if any(s.startswith(p) for p in ("BTC", "ETH", "LTC", "XRP")) or s in ("BTCUSD","ETHUSD"):
+        return "CRYPTO"
+    return "FOREX"
+
+# Defaults are generic and safe. If The 5%ers specs differ, adjust here.
+INSTRUMENT_SPECS: Dict[str, Dict[str, float]] = {
+    # Metals (CFD)
+    "XAUUSD": {"tick_size": 0.01, "contract_size": 100.0,  "point_value_usd_per_lot": 1.0},
+    "XAGUSD": {"tick_size": 0.01, "contract_size": 5000.0, "point_value_usd_per_lot": 50.0},
+
+    # Indices (CFD) — common: $1 per index point per lot
+    "US30":   {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "US500":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "SP500":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "NAS100": {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "DAX40":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "GER40":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "UK100":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "JPN225": {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+    "JP225":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
+
+    # Crypto (CFD) — common: 1 lot = 1 coin, $0.01 tick => $0.01 per point per lot
+    "BTCUSD": {"tick_size": 0.01, "contract_size": 1.0, "point_value_usd_per_lot": 0.01},
+    "ETHUSD": {"tick_size": 0.01, "contract_size": 1.0, "point_value_usd_per_lot": 0.01},
+}
+
+def _get_spec(symbol: str) -> Dict[str, float]:
+    s = (symbol or "").upper()
+    if s in INSTRUMENT_SPECS:
+        return INSTRUMENT_SPECS[s]
+    typ = instrument_type_for(s)
+    if typ == "FOREX":
+        return {"tick_size": (0.01 if s.endswith("JPY") else 0.0001),
+                "contract_size": 100_000.0,
+                "point_value_usd_per_lot": None}
+    if typ == "METAL":
+        return {"tick_size": 0.01, "contract_size": 100.0, "point_value_usd_per_lot": 1.0}
+    if typ == "INDEX":
+        return {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0}
+    if typ == "CRYPTO":
+        return {"tick_size": 0.01, "contract_size": 1.0, "point_value_usd_per_lot": 0.01}
+    return {"tick_size": 0.0001, "contract_size": 100_000.0, "point_value_usd_per_lot": None}
+
 def pip_size_for(pair: str) -> float:
-    # XAU: 0.01 ; JPY: 0.01 ; sinon 0.0001
-    p = pair.upper()
-    if p.startswith("XAU"):
-        return 0.01
-    return 0.01 if p.endswith("JPY") else 0.0001
+    """Return the tick size used to convert price distance to 'points' (your 'pips')."""
+    return _get_spec(pair)["tick_size"]
 
 def contract_size_for(pair: str) -> float:
-    # XAU 1 lot = 100 oz ; FX 1 lot = 100,000 unités de base
-    return 100.0 if pair.upper().startswith("XAU") else 100_000.0
+    """Contract size for one lot."""
+    return _get_spec(pair)["contract_size"]
+
+def pip_value_per_lot_usd_at(conn, pair: str, entry_ts: int, entry_price: float) -> float:
+    """
+    USD account — USD per 'point' (tick_size) for 1 lot.
+    - FOREX:
+        * xxxUSD: value = contract_size * tick_size
+        * USDxxx: value = (contract_size * tick_size) / price  (JPY: ≈ 1000 / USDJPY)
+        * Crosses: convert via USD quote (use USDXXX or XXXUSD)
+    - METAL/INDEX/CRYPTO: use per-symbol 'point_value_usd_per_lot' from INSTRUMENT_SPECS.
+    """
+    spec = _get_spec(pair)
+    tick = spec["tick_size"]
+    cs   = spec["contract_size"]
+    pv   = spec.get("point_value_usd_per_lot")
+    p    = (pair or "").upper()
+    typ  = instrument_type_for(p)
+
+    # Non-FX or explicit point value
+    if typ in ("METAL", "INDEX", "CRYPTO") or pv is not None:
+        return pv if pv is not None else cs * tick
+
+    # FOREX
+    if p.endswith("USD"):
+        return cs * tick
+    if p.startswith("USD"):
+        if p.endswith("JPY"):
+            usdjpy = fx_close_at(conn, "USDJPY", entry_ts) or entry_price
+            return 1000.0 / max(usdjpy, 1e-9)
+        return (cs * tick) / max(entry_price, 1e-9)
+
+    # Crosses (no USD side): convert via quote currency to USD
+    quote = p[3:6]  # e.g., 'GBP' in 'EURGBP'
+    conv1 = f"{quote}USD"
+    conv2 = f"USD{quote}"
+    px1 = fx_close_at(conn, conv1, entry_ts)
+    if px1 is not None:
+        return (cs * tick) * px1
+    px2 = fx_close_at(conn, conv2, entry_ts)
+    if px2 is not None:
+        return (cs * tick) / max(px2, 1e-9)
+
+    return cs * tick  # safe fallback
+
+def notional_usd_at(conn, pair: str, entry_ts: int, entry_price: float, lot_size: float) -> float:
+    """
+    Approx notional in USD for leverage display. Uses per-class logic.
+    """
+    spec = _get_spec(pair)
+    cs   = spec["contract_size"]
+    typ  = instrument_type_for(pair)
+    p    = (pair or "").upper()
+
+    if typ in ("METAL", "INDEX", "CRYPTO"):
+        pv = spec.get("point_value_usd_per_lot")
+        if pv is not None and spec["tick_size"] > 0:
+            points = entry_price / max(spec["tick_size"], 1e-12)
+            return lot_size * pv * points
+        return lot_size * cs * entry_price
+
+    # FOREX (USD account)
+    if p.endswith("USD"):
+        return lot_size * cs * entry_price
+    if p.startswith("USD"):
+        return lot_size * cs
+    if p.endswith("JPY"):
+        usdjpy = fx_close_at(conn, "USDJPY", entry_ts) or entry_price
+        notion_jpy = lot_size * cs * entry_price
+        return notion_jpy / max(usdjpy, 1e-9)
+    return lot_size * cs * entry_price
+
+# ======================  CHANGES END: multi-asset sizing  ======================
 
 def fmt_price(pair: str, x: float) -> str:
     if pair.upper().endswith("JPY"):
@@ -204,39 +324,6 @@ def fx_close_at(conn, pair: str, ts_ms: int) -> Optional[float]:
     except Exception:
         conn.rollback()
         return None
-
-def pip_value_per_lot_usd_at(conn, pair: str, entry_ts: int, entry_price: float) -> float:
-    """
-    USD account — USD per pip for 1 lot.
-    - xxxUSD : 10
-    - *JPY (incl. USDJPY) : 1000 / USDJPY
-    - XAUUSD : 100 * 0.01 = 1
-    - else   : 10 (fallback)
-    """
-    p = pair.upper()
-    if p.startswith("XAU") and p.endswith("USD"):
-        return contract_size_for(pair) * pip_size_for(pair)  # 100 * 0.01 = 1
-    if p.endswith("USD"):
-        return 10.0
-    if p.endswith("JPY"):
-        usdjpy = fx_close_at(conn, "USDJPY", entry_ts) or entry_price
-        return 1000.0 / max(usdjpy, 1e-9)
-    if p.startswith("USD"):
-        return 10.0
-    return 10.0
-
-def notional_usd_at(conn, pair: str, entry_ts: int, entry_price: float, lot_size: float) -> float:
-    p = pair.upper()
-    cs = contract_size_for(pair)
-    if p.endswith("USD"):
-        return lot_size * cs * entry_price
-    if p.startswith("USD"):
-        return lot_size * cs
-    if p.endswith("JPY"):
-        usdjpy = fx_close_at(conn, "USDJPY", entry_ts) or entry_price
-        notion_jpy = lot_size * cs * entry_price
-        return notion_jpy / max(usdjpy, 1e-9)
-    return lot_size * cs
 
 # ---------- FSM / Trade ----------
 @dataclass
@@ -793,7 +880,7 @@ def run_all(conn,
                 f"{pt.lot_size:.3f}",
                 f"{pt.lev_used:.2f}x",
                 f"{pt.fee_total:.2f}",
-                f"{pnl_net:+.2f}",
+                f"{pt.pnl_net:+.2f}",
                 f"{equity:,.2f}",
                 f"{iso_utc(pt.closed_ts).split('T')[0]} {hm_utc(pt.closed_ts)}" if pt.closed_ts else ""
             ]
