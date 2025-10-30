@@ -836,25 +836,18 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         # --- Phase A: NOT READY (tracking)
         if st is None or st == "":
             if side == "LONG":
-                # Si la bougie continue le mouvement haussier, on met à jour entry et SL
-                if h > (entry_base or -1e9):
+                # Only update on NEW HH: entry = bar high, SL = bar low
+                if entry_base is None or h > entry_base:
                     entry_base = h
-                    sl_base = l  # trailing SL sur le low de cette bougie
-                else:
-                    # sinon, comportement normal (mise à jour si plus bas que SL actuel)
-                    new_sl = should_update_sl("LONG", sl_base, l, h)
-                    if new_sl is not None:
-                        sl_base = new_sl
+                    sl_base = l  # anchor = low of the bar that made the HH
+                # else: no change to SL here (we do NOT trail without a new HH)
 
             else:  # SHORT
-                # Si la bougie continue le mouvement baissier, on met à jour entry et SL
-                if l < (entry_base or 1e9):
+                # Only update on NEW LL: entry = bar low, SL = bar high
+                if entry_base is None or l < entry_base:
                     entry_base = l
-                    sl_base = h  # trailing SL sur le high de cette bougie
-                else:
-                    new_sl = should_update_sl("SHORT", sl_base, l, h)
-                    if new_sl is not None:
-                        sl_base = new_sl
+                    sl_base = h  # anchor = high of the bar that made the LL
+                # else: no change to SL here (we do NOT trail without a new LL)
 
             update_base_entry_sl(entry_base, sl_base)
 
@@ -862,32 +855,29 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
             if antagonistic(o, c, side):
                 entry_frozen = round_price(pair, entry_base)
 
-                # IMPORTANT: sur la bougie de pullback, on ne "dégrade"
-                # le SL que selon la règle demandée (comparé au SL en DB avant cette bougie = cur_sl).
+                # NEW: Pullback rule
+                # LONG  -> SL = min(low at last HH bar, pullback low)
+                # SHORT -> SL = max(high at last LL bar, pullback high)
                 if side == "LONG":
-                    # Only lower it if new candidate is LOWER than DB SL
-                    if cur_sl is not None:
-                        sl_start = round_price(pair, min(sl_base, cur_sl))
-                    else:
-                        sl_start = round_price(pair, sl_base)
-                else:
-                    # SHORT: Only raise it if new candidate is HIGHER than DB SL
-                    if cur_sl is not None:
-                        sl_start = round_price(pair, max(sl_base, cur_sl))
-                    else:
-                        sl_start = round_price(pair, sl_base)
+                    sl_start = round_price(pair, min(sl_base, l))
+                else:  # SHORT
+                    sl_start = round_price(pair, max(sl_base, h))
 
                 tp_r = round_price(pair, compute_tp(entry_frozen, sl_start, side, row_cur["tp_level"]))
 
-                mark_pullback(conn, pair, today, ts, float(sl_start), float(entry_frozen), float(sl_start), float(tp_r))
+                mark_pullback(conn, pair, today, ts, float(sl_start),
+                              float(entry_frozen), float(sl_start), float(tp_r))
 
                 if ENABLE_TRADING and MT5_ENABLED and mt5_initialize():
-                    ok, oid, reqid, otype, lots = place_stop_order(pair, side, float(entry_frozen), float(sl_start), float(tp_r))
+                    ok, oid, reqid, otype, lots = place_stop_order(
+                        pair, side, float(entry_frozen), float(sl_start), float(tp_r)
+                    )
                     with conn.cursor() as cur:
                         cur.execute(f"""UPDATE {live_tbl()} SET risk_pct=%s,lots=%s,mt5_order_id=%s,mt5_request_id=%s,
                                         mt5_order_type=%s,order_status=%s,updated_at=NOW()
                                         WHERE pair=%s AND trade_date=%s""",
-                                    (RISK_PERCENT, lots, oid, reqid, otype, ("PLACED" if ok else "REJECTED"), pair, today)); conn.commit()
+                                    (RISK_PERCENT, lots, oid, reqid, otype,
+                                     ("PLACED" if ok else "REJECTED"), pair, today)); conn.commit()
                 bump_last_processed(conn, pair, today, ts); continue
 
         # --- Phase B: READY — trail SL only if bar extends vs current SL
