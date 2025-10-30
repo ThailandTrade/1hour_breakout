@@ -3,21 +3,25 @@
 """
 New York Breakout + Pullback — Backtester multi-sessions (TP unique par paire)
 
+CHANGES (TYPE-aware lot sizing, no per-symbol specs):
+- Session file can optionally include a column TYPE (FOREX | METAL | INDEX | CRYPTO).
+- TYPE overrides symbol-based inference for sizing (tick_size, point value, notional).
+- No hard-coded INSTRUMENT_SPECS per symbol; we use CLASS_DEFAULTS per TYPE only.
+- Display: adds 'Type' column in the final table for clarity.
+
 Règles clés :
-- Fichier session_pairs.txt : lignes "SESSION,PAIR,TPx" (ex: NY,EURUSD,TP1).
+- Fichier session_pairs.txt : lignes "SESSION,PAIR,TP[,TYPE][,MON,TUE,WED,THU,FRI]".
 - Chaque paire a un seul objectif : TP1 ou TP2 ou TP3.
 - Outcome binaire : TP (avant SL) sinon SL.
 - R-multiple par trade : +k R si TPk atteint avant SL, sinon -1 R.
 - Sizing : risque % sur capital disponible (equity - risques ouverts).
-- Frais : 3.5 USD par lot par transaction (entrée et sortie).
+- Frais : 3.5 USD par lot par transaction (entrée et sortie). (modifiable via --fee-per-lot)
 
 Sorties :
 - Tableau final : TP (prix) et Résultat (TP/SL) au lieu de colonnes multiples.
 - Summary global (trades, winrate, expectancy R, fees, capital final, MDD).
 - Max Daily Drawdown (pire journée, en $ et %).
-- NEW: Breakdown par jour de la semaine (basé sur la date d'entrée).
-
-Auteur : refonte complète demandée par l’utilisateur (FR intégral).
+- Breakdown par jour de la semaine (basé sur la date d'entrée).
 """
 
 import os, sys, argparse, csv
@@ -86,7 +90,6 @@ def tokyo_signal_window(d: date) -> Tuple[int, int]:
     fin   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)   # 05:45
     return debut, fin
 
-# *** ALIGNÉ AVEC LE SCRIPT DE RÉFÉRENCE ***
 def london_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
     debut = int((base + timedelta(hours=8)).timestamp()*1000)                # 08:00
@@ -98,7 +101,6 @@ def ny_signal_window(d: date) -> Tuple[int, int]:
     debut = int((base + timedelta(hours=13)).timestamp()*1000)               # 13:00
     fin   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 17:45
     return debut, fin
-
 
 def window_for_session(session: str, d: date) -> Tuple[int, int]:
     s = (session or "").strip().upper()
@@ -122,11 +124,20 @@ def table_name(pair: str, tf: str) -> str:
 def pip_eps_for(pair: str) -> float:
     return 0.001 if pair.upper().endswith("JPY") else 0.00001
 
-# =====================  CHANGES START: multi-asset sizing  =====================
+# =====================  TYPE-aware / multi-asset sizing (no per-symbol specs)  =====================
+
+# Global override map filled from session file when TYPE column exists
+TYPE_OVERRIDE: Dict[str, str] = {}  # e.g., {"NAS100": "INDEX", "XAUUSD": "METAL"}
 
 def instrument_type_for(symbol: str) -> str:
-    """Return one of: FOREX | METAL | INDEX | CRYPTO."""
+    """Return one of: FOREX | METAL | INDEX | CRYPTO (with session-file override if provided)."""
     s = (symbol or "").upper()
+    # 1) explicit override from session file
+    typ = TYPE_OVERRIDE.get(s)
+    if typ:
+        return typ
+
+    # 2) heuristics by symbol (fallback only)
     if s in ("XAUUSD", "XAGUSD", "XPTUSD", "XPDUSD"):
         return "METAL"
     if any(s.startswith(p) for p in ("US30", "US500", "SP500", "NAS100", "DAX40", "GER40", "UK100", "FRA40", "JP225", "JPN225", "HK50", "AUS200", "ES35", "IT40", "CN50")):
@@ -135,44 +146,29 @@ def instrument_type_for(symbol: str) -> str:
         return "CRYPTO"
     return "FOREX"
 
-# Defaults are generic and safe. If The 5%ers specs differ, adjust here.
-INSTRUMENT_SPECS: Dict[str, Dict[str, float]] = {
-    # Metals (CFD)
-    "XAUUSD": {"tick_size": 0.01, "contract_size": 100.0,  "point_value_usd_per_lot": 1.0},
-    "XAGUSD": {"tick_size": 0.01, "contract_size": 5000.0, "point_value_usd_per_lot": 50.0},
-
-    # Indices (CFD) — common: $1 per index point per lot
-    "US30":   {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "US500":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "SP500":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "NAS100": {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "DAX40":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "GER40":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "UK100":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "JPN225": {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-    "JP225":  {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0},
-
-    # Crypto (CFD) — common: 1 lot = 1 coin, $0.01 tick => $0.01 per point per lot
-    "BTCUSD": {"tick_size": 0.01, "contract_size": 1.0, "point_value_usd_per_lot": 0.01},
-    "ETHUSD": {"tick_size": 0.01, "contract_size": 1.0, "point_value_usd_per_lot": 0.01},
+# Class defaults ONLY (no per-symbol table)
+CLASS_DEFAULTS = {
+    "FOREX":  {"tick_size": 0.0001, "tick_size_jpy": 0.01, "contract_size": 100_000.0, "point_value_usd_per_lot": None},
+    "METAL":  {"tick_size": 0.01,   "contract_size": 100.0, "point_value_usd_per_lot": 1.0},   # $1 per 0.01
+    "INDEX":  {"tick_size": 1.0,    "contract_size": 1.0,   "point_value_usd_per_lot": 1.0},   # $1 per 1.0
+    "CRYPTO": {"tick_size": 0.01,   "contract_size": 1.0,   "point_value_usd_per_lot": 0.01},  # $0.01 per 0.01
 }
 
 def _get_spec(symbol: str) -> Dict[str, float]:
-    s = (symbol or "").upper()
-    if s in INSTRUMENT_SPECS:
-        return INSTRUMENT_SPECS[s]
-    typ = instrument_type_for(s)
+    typ = instrument_type_for(symbol)
     if typ == "FOREX":
-        return {"tick_size": (0.01 if s.endswith("JPY") else 0.0001),
-                "contract_size": 100_000.0,
-                "point_value_usd_per_lot": None}
-    if typ == "METAL":
-        return {"tick_size": 0.01, "contract_size": 100.0, "point_value_usd_per_lot": 1.0}
-    if typ == "INDEX":
-        return {"tick_size": 1.0, "contract_size": 1.0, "point_value_usd_per_lot": 1.0}
-    if typ == "CRYPTO":
-        return {"tick_size": 0.01, "contract_size": 1.0, "point_value_usd_per_lot": 0.01}
-    return {"tick_size": 0.0001, "contract_size": 100_000.0, "point_value_usd_per_lot": None}
+        is_jpy = (symbol or "").upper().endswith("JPY")
+        return {
+            "tick_size": CLASS_DEFAULTS["FOREX"]["tick_size_jpy"] if is_jpy else CLASS_DEFAULTS["FOREX"]["tick_size"],
+            "contract_size": CLASS_DEFAULTS["FOREX"]["contract_size"],
+            "point_value_usd_per_lot": None
+        }
+    d = CLASS_DEFAULTS[typ]
+    return {
+        "tick_size": d["tick_size"],
+        "contract_size": d["contract_size"],
+        "point_value_usd_per_lot": d["point_value_usd_per_lot"],
+    }
 
 def pip_size_for(pair: str) -> float:
     """Return the tick size used to convert price distance to 'points' (your 'pips')."""
@@ -189,7 +185,7 @@ def pip_value_per_lot_usd_at(conn, pair: str, entry_ts: int, entry_price: float)
         * xxxUSD: value = contract_size * tick_size
         * USDxxx: value = (contract_size * tick_size) / price  (JPY: ≈ 1000 / USDJPY)
         * Crosses: convert via USD quote (use USDXXX or XXXUSD)
-    - METAL/INDEX/CRYPTO: use per-symbol 'point_value_usd_per_lot' from INSTRUMENT_SPECS.
+    - METAL/INDEX/CRYPTO: class defaults only.
     """
     spec = _get_spec(pair)
     tick = spec["tick_size"]
@@ -198,9 +194,8 @@ def pip_value_per_lot_usd_at(conn, pair: str, entry_ts: int, entry_price: float)
     p    = (pair or "").upper()
     typ  = instrument_type_for(p)
 
-    # Non-FX or explicit point value
-    if typ in ("METAL", "INDEX", "CRYPTO") or pv is not None:
-        return pv if pv is not None else cs * tick
+    if typ in ("METAL", "INDEX", "CRYPTO"):
+        return pv  # class default
 
     # FOREX
     if p.endswith("USD"):
@@ -234,11 +229,9 @@ def notional_usd_at(conn, pair: str, entry_ts: int, entry_price: float, lot_size
     p    = (pair or "").upper()
 
     if typ in ("METAL", "INDEX", "CRYPTO"):
-        pv = spec.get("point_value_usd_per_lot")
-        if pv is not None and spec["tick_size"] > 0:
-            points = entry_price / max(spec["tick_size"], 1e-12)
-            return lot_size * pv * points
-        return lot_size * cs * entry_price
+        pv = spec["point_value_usd_per_lot"]
+        points = entry_price / max(spec["tick_size"], 1e-12)
+        return lot_size * pv * points
 
     # FOREX (USD account)
     if p.endswith("USD"):
@@ -251,8 +244,7 @@ def notional_usd_at(conn, pair: str, entry_ts: int, entry_price: float, lot_size
         return notion_jpy / max(usdjpy, 1e-9)
     return lot_size * cs * entry_price
 
-# ======================  CHANGES END: multi-asset sizing  ======================
-
+# ---------- Formatting ----------
 def fmt_price(pair: str, x: float) -> str:
     if pair.upper().endswith("JPY"):
         return f"{x:.3f}"
@@ -333,7 +325,6 @@ class Trade:
     entry: float
     sl: float
 
-# *** ALIGNÉ AVEC LE SCRIPT DE RÉFÉRENCE — SL = BAR i-1 ***
 def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
     """
     Break strict (close > high ou close < low), puis pullback antagoniste (close contraire),
@@ -343,17 +334,16 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
     long_active = False
     long_hh: Optional[float] = None
     long_pullback_idx: Optional[int] = None
-    long_min_low_since_pullback: Optional[float] = None  # LOW min depuis le pullback (inclus)
+    long_min_low_since_pullback: Optional[float] = None
 
     short_active = False
     short_ll: Optional[float] = None
     short_pullback_idx: Optional[int] = None
-    short_max_high_since_pullback: Optional[float] = None  # HIGH max depuis le pullback (inclus)
+    short_max_high_since_pullback: Optional[float] = None
 
     for i, b in enumerate(c15):
         ts, o, h, l, c = b["ts"], b["open"], b["high"], b["low"], b["close"]
 
-        # Activation LONG/SHORT sur break strict du range H1
         if (not long_active) and (c > range_high):
             long_active = True
             long_hh = h
@@ -370,12 +360,10 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
         if long_active:
             prev_hh = long_hh
 
-            # Pullback antagoniste = bougie rouge (close < open)
             if long_pullback_idx is None and (c < o):
                 long_pullback_idx = i
-                long_min_low_since_pullback = l  # inclut la bougie de pullback
+                long_min_low_since_pullback = l
 
-            # Met à jour le LOW min depuis le pullback à chaque bar suivante
             if long_pullback_idx is not None and i >= 1:
                 prev_low = c15[i-1]["low"]
                 long_min_low_since_pullback = (
@@ -384,13 +372,11 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
                     else min(long_min_low_since_pullback, prev_low)
                 )
 
-            # Wick trigger : dépasse le hh du break après le pullback
             if (prev_hh is not None) and (long_pullback_idx is not None) and (i > long_pullback_idx) and (h > prev_hh) and (i >= 1):
                 entry_price = prev_hh
                 sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
                 return Trade("LONG", ts, entry_price, sl_price)
 
-            # Suivi du hh courant
             if (long_hh is None) or (h > long_hh):
                 long_hh = h
 
@@ -398,12 +384,10 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
         if short_active:
             prev_ll = short_ll
 
-            # Pullback antagoniste = bougie verte (close > open)
             if short_pullback_idx is None and (c > o):
                 short_pullback_idx = i
-                short_max_high_since_pullback = h  # inclut la bougie de pullback
+                short_max_high_since_pullback = h
 
-            # Met à jour le HIGH max depuis le pullback à chaque bar suivante
             if short_pullback_idx is not None and i >= 1:
                 prev_high = c15[i-1]["high"]
                 short_max_high_since_pullback = (
@@ -412,24 +396,18 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
                     else max(short_max_high_since_pullback, prev_high)
                 )
 
-            # Wick trigger : casse le ll du break après le pullback
             if (prev_ll is not None) and (short_pullback_idx is not None) and (i > short_pullback_idx) and (l < prev_ll) and (i >= 1):
                 entry_price = prev_ll
                 sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
                 return Trade("SHORT", ts, entry_price, sl_price)
 
-            # Suivi du ll courant
             if (short_ll is None) or (l < short_ll):
                 short_ll = l
 
     return None
 
-
-# ---------- Évaluation après entrée — LOGIQUE DE RÉFÉRENCE ----------
+# ---------- Évaluation après entrée ----------
 def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
-    """
-    Enregistre les timestamps de RR1/RR2/RR3/SL; stop au premier SL ou RR3.
-    """
     eps = pip_eps_for(pair)
     entry, sl = tr.entry, tr.sl
     r = abs(entry - sl)
@@ -466,7 +444,6 @@ def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
         if hit_time["RR2"] is None and rr2_hit: hit_time["RR2"] = ts
         if hit_time["RR3"] is None and rr3_hit: hit_time["RR3"] = ts
 
-        # Arrêt au premier SL ou RR3
         if (hit_time["SL"] is not None) or (hit_time["RR3"] is not None):
             break
 
@@ -484,23 +461,15 @@ def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
     sl = hits.get("SL")
     return t is not None and (sl is None or t < sl)
 
-# ---------- Évaluation pour TP unique — en s'appuyant sur la logique de référence ----------
 def evaluate_trade_tp_only(conn, pair: str, tr: Trade, tp_level: str):
-    """
-    Utilise evaluate_trade_after_entry() pour déterminer si le TP demandé (TP1/TP2/TP3)
-    est atteint avant SL. Renvoie (tp_price, 'TP'|'SL', closed_ts_tp_or_sl, r_mult).
-    """
     targets, _results, hits, _closed_ts_ref = evaluate_trade_after_entry(conn, pair, tr)
-
     lvl = (tp_level or "").strip().upper()
     key = "RR1" if lvl == "TP1" else "RR2" if lvl == "TP2" else "RR3"
     tp_price = targets[key]
 
     if reached_before(hits, key):
-        # Ferme au timestamp du TP choisi
         return tp_price, "TP", hits[key], float(1 if key=="RR1" else 2 if key=="RR2" else 3)
     else:
-        # Ferme au timestamp de SL
         return tp_price, "SL", hits["SL"], -1.0
 
 # ---------- Affichages ----------
@@ -508,7 +477,7 @@ def show_table(rows):
     from prettytable import PrettyTable
     t = PrettyTable()
     t.field_names = [
-        "Pair","Session","TP visé",
+        "Pair","Type","Session","TP visé",
         "1H High","1H Low",
         "Entry (UTC)","Entry","SL","Stop (pips)",
         "TP (prix)","Résultat","R-mult",
@@ -562,32 +531,17 @@ def print_monthly_breakdown(monthly):
     print(t)
     print("=============================")
 
-# NEW: Weekday breakdown printer
 def print_weekday_breakdown(weekday_stats: Dict[int, Dict[str, Any]]):
-    """
-    weekday_stats keys are Python weekdays: 0=Mon ... 6=Sun
-    """
     from prettytable import PrettyTable
     names = ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]
     t = PrettyTable()
     t.field_names = ["Jour","Trades","Wins","Losses","Winrate %","Avg R","PnL $","Frais $"]
     for wd in range(7):
         st = weekday_stats.get(wd, {"trades":0,"wins":0,"losses":0,"pnl":0.0,"fees":0.0,"r_sum":0.0})
-        trades = st["trades"]
-        wins   = st["wins"]
-        losses = st["losses"]
+        trades = st["trades"]; wins = st["wins"]; losses = st["losses"]
         winrate = (wins/(wins+losses)*100.0) if (wins+losses)>0 else 0.0
         avg_r   = (st["r_sum"]/trades) if trades>0 else 0.0
-        t.add_row([
-            names[wd],
-            trades,
-            wins,
-            losses,
-            f"{winrate:.2f}",
-            f"{avg_r:+.3f}",
-            f"{st['pnl']:,.2f}",
-            f"{st['fees']:,.2f}",
-        ])
+        t.add_row([names[wd], trades, wins, losses, f"{winrate:.2f}", f"{avg_r:+.3f}", f"{st['pnl']:,.2f}", f"{st['fees']:,.2f}"])
     print("\n===== BREAKDOWN PAR JOUR DE LA SEMAINE (basé sur la date d'entrée) =====")
     print(t)
     print("=========================================================================")
@@ -603,6 +557,7 @@ class PreparedTrade:
     outcome: str        # "TP" | "SL"
     closed_ts: Optional[int]
     r_mult: float
+    instr_type: str = "FOREX"
     risk_amount: float = 0.0
     lot_size: float = 0.0
     fee_total: float = 0.0
@@ -617,25 +572,19 @@ def run_all(conn,
             fee_per_lot: float,
             min_stop_pips: float):
 
-    """
-    session_pairs : liste de tuples (SESSION, PAIR, TPx)
-    """
     prepared: List[PreparedTrade] = []
-    seen_sessions = set()  # 1 trade max par (SESSION, PAIR, DATE)
-
-    # *** Anti-chevauchement (logique de référence) ***
-    last_close_by_key: Dict[Tuple[str, str], Optional[int]] = {}  # (session, pair) -> last_close_ts (SL ou RR3)
+    seen_sessions = set()
+    last_close_by_key: Dict[Tuple[str, str], Optional[int]] = {}
 
     for d in daterange(start, end):
-        wd = d.weekday()  # 0 = lundi ... 6 = dimanche
+        wd = d.weekday()
         for sess, pair, tp_level, allowed_by_wd in session_pairs:
-            # ⛔ Ignore les jours marqués "N"
             if not allowed_by_wd.get(wd, False):
                 continue
 
             key = (sess.upper(), pair.upper(), d)
             if key in seen_sessions:
-                continue  # déjà traité pour cette session/paire/jour
+                continue
 
             c1 = read_first_1h(conn, pair, d)
             if not c1:
@@ -649,56 +598,46 @@ def run_all(conn,
             if not tr:
                 continue
 
-            # Anti-overlap : pas d'entrée si trade précédent (même session, même paire) pas encore clôturé
             last_key = (sess.upper(), pair.upper())
             last_close_ts = last_close_by_key.get(last_key)
             if last_close_ts is not None and tr.entry_ts <= last_close_ts:
-                seen_sessions.add(key)  # on consomme quand même la journée/session/paire
+                seen_sessions.add(key)
                 continue
 
-            # Skip si stop < min_stop_pips (et on "consomme" la session/paire/jour)
             pip_sz = pip_size_for(pair)
             stop_pips = abs(tr.entry - tr.sl) / max(pip_sz, 1e-12)
             seen_sessions.add(key)
             if stop_pips < min_stop_pips:
                 continue
 
-            # *** Évaluation de référence (timestamps RR/SL + closed_ts_ref = 1er SL ou RR3) ***
             targets, _res, hits, closed_ts_ref = evaluate_trade_after_entry(conn, pair, tr)
 
-            # *** Décision TP unique : ferme au TP demandé si avant SL, sinon SL ***
             lvl = (tp_level or "").strip().upper()
             rr_key = "RR1" if lvl == "TP1" else "RR2" if lvl == "TP2" else "RR3"
             tp_price = targets[rr_key]
 
             if reached_before(hits, rr_key):
-                outcome = "TP"
-                r_mult  = float(1 if rr_key=="RR1" else 2 if rr_key=="RR2" else 3)
+                outcome = "TP"; r_mult = float(1 if rr_key=="RR1" else 2 if rr_key=="RR2" else 3)
                 closed_ts_user = hits[rr_key]
             else:
-                outcome = "SL"
-                r_mult  = -1.0
+                outcome = "SL"; r_mult = -1.0
                 closed_ts_user = hits["SL"]
 
-            # Met à jour l’anti-overlap avec la clôture de RÉFÉRENCE (SL ou RR3, le premier)
             if closed_ts_ref is not None:
                 last_close_by_key[last_key] = closed_ts_ref
-            else:
-                # fallback : si pas de close trouvé (cas pathologique), on bloque rien
-                last_close_by_key[last_key] = last_close_by_key.get(last_key, None)
 
+            instr_type = instrument_type_for(pair)
             pt = PreparedTrade(pair=pair, session=sess, tp_level=tp_level,
                                tr=tr, tp_price=tp_price, outcome=outcome,
-                               closed_ts=closed_ts_user, r_mult=r_mult)
+                               closed_ts=closed_ts_user, r_mult=r_mult,
+                               instr_type=instr_type)
             prepared.append(pt)
-
 
     if not prepared:
         print("Aucun trade trouvé sur la période/sélection.")
         print_summary(0, 0, 0, 0.0, start_capital, start_capital, 0.0, 0.0, 0.0, 0.0, 0.0, None, "ALL")
         return
 
-    # Évènements (entrées / sorties) pour simuler l’equity dans le temps
     from collections import defaultdict
     evmap: Dict[int, List[Tuple[str, PreparedTrade]]] = defaultdict(list)
     for pt in prepared:
@@ -723,26 +662,16 @@ def run_all(conn,
     def ensure_month(dt: date):
         key = f"{dt.year:04d}-{dt.month:02d}"
         if key not in monthly:
-            monthly[key] = {
-                "equity_start": None,
-                "pnl": 0.0,
-                "fees": 0.0,
-                "trades": 0,
-                "wins": 0,
-                "losses": 0,
-            }
+            monthly[key] = {"equity_start": None, "pnl": 0.0, "fees": 0.0, "trades": 0, "wins": 0, "losses": 0}
         return key
 
-    # Max Daily Drawdown suivi
     daily: Dict[str, Dict[str, float]] = {}
     worst_daily_dd_abs = 0.0
     worst_daily_dd_pct = 0.0
     worst_daily_day: Optional[str] = None
 
-    # NEW: weekday stats (based on entry date)
-    weekday_stats: Dict[int, Dict[str, Any]] = {}  # 0=Mon..6=Sun
+    weekday_stats: Dict[int, Dict[str, Any]] = {}
 
-    # Cache H/L 1H
     hl_cache: Dict[Tuple[str, date], Tuple[float, float]] = {}
     for d in daterange(start, end):
         for _, pair, _, __ in session_pairs:
@@ -761,7 +690,6 @@ def run_all(conn,
             if etype != "ENTRY":
                 continue
 
-            # une position max par paire en même temps
             if any(ot.pair == pt.pair for ot in open_trades):
                 continue
 
@@ -774,7 +702,7 @@ def run_all(conn,
             pip_val = pip_value_per_lot_usd_at(conn, pt.pair, pt.tr.entry_ts, pt.tr.entry)
 
             lot_size = 0.0
-            if stop_pips > 0 and pip_val > 0 and risk_amount > 0:
+            if stop_pips > 0 and pip_val and risk_amount > 0:
                 lot_size = risk_amount / (stop_pips * pip_val)
 
             fee_total = float(fee_per_lot) * lot_size * 2.0
@@ -796,8 +724,7 @@ def run_all(conn,
             monthly[mk]["trades"] += 1
             total_trades += 1
 
-            # init weekday bucket on ENTRY (based on entry_date)
-            wd = entry_date.weekday()  # 0=Mon..6=Sun
+            wd = entry_date.weekday()
             if wd not in weekday_stats:
                 weekday_stats[wd] = {"trades":0,"wins":0,"losses":0,"pnl":0.0,"fees":0.0,"r_sum":0.0}
             weekday_stats[wd]["trades"] += 1
@@ -815,7 +742,6 @@ def run_all(conn,
             total_fees += pt.fee_total
             pt.pnl_net = pnl_net
 
-            # Daily bucket
             day_key = datetime.fromtimestamp((pt.closed_ts or ts)/1000, tz=UTC).date().isoformat()
             if day_key not in daily:
                 daily[day_key] = {"start": equity_before, "min": equity_before, "end": equity_before}
@@ -824,14 +750,12 @@ def run_all(conn,
             if equity < drec["min"]:
                 drec["min"] = equity
 
-            # Win/loss + R list
             if pt.outcome == "TP":
                 wins += 1
             else:
                 losses += 1
             r_list.append(pt.r_mult)
 
-            # Update MDD global
             if equity > peak_equity:
                 peak_equity = equity
             dd_abs = peak_equity - equity
@@ -839,7 +763,6 @@ def run_all(conn,
                 max_dd_abs = dd_abs
                 max_dd_pct = (dd_abs / peak_equity) * 100.0 if peak_equity > 0 else 0.0
 
-            # Monthly bucket
             entry_date = datetime.fromtimestamp(pt.tr.entry_ts/1000, tz=UTC).date()
             mk = ensure_month(entry_date)
             monthly[mk]["pnl"]  += pnl_net
@@ -847,7 +770,6 @@ def run_all(conn,
             if pt.outcome == "TP": monthly[mk]["wins"] += 1
             else:                   monthly[mk]["losses"] += 1
 
-            # Weekday bucket (based on entry_date)
             wd = entry_date.weekday()
             wb = weekday_stats[wd]
             wb["pnl"]  += pnl_net
@@ -859,7 +781,6 @@ def run_all(conn,
             if pt in open_trades:
                 open_trades.remove(pt)
 
-            # Ligne du tableau
             day = datetime.fromtimestamp(pt.tr.entry_ts/1000, tz=UTC).date()
             rh, rl = hl_cache.get((pt.pair, day), (pt.tr.entry, pt.tr.entry))
             pip_sz = pip_size_for(pt.pair)
@@ -867,6 +788,7 @@ def run_all(conn,
 
             row = [
                 pt.pair,
+                pt.instr_type,
                 pt.session,
                 pt.tp_level.upper(),
                 fmt_price(pt.pair, rh), fmt_price(pt.pair, rl),
@@ -886,13 +808,11 @@ def run_all(conn,
             ]
             final_rows_with_sort.append((pt.closed_ts or pt.tr.entry_ts, pt.tr.entry_ts, row))
 
-    # Max Daily Drawdown (après boucle)
     worst_daily_dd_abs = 0.0
     worst_daily_dd_pct = 0.0
     worst_daily_day = None
     for dk, rec in daily.items():
-        start_e = rec["start"]
-        min_e   = rec["min"]
+        start_e = rec["start"]; min_e = rec["min"]
         if start_e > 0:
             dd_abs = max(0.0, start_e - min_e)
             dd_pct = (dd_abs / start_e) * 100.0
@@ -901,14 +821,12 @@ def run_all(conn,
                 worst_daily_dd_pct = dd_pct
                 worst_daily_day = dk
 
-    # Table
     if final_rows_with_sort and SHOW_TRADES:
         final_rows_with_sort.sort(key=lambda t: (t[0], t[1], t[2][0]))
         show_table([r for _, __, r in final_rows_with_sort])
     elif not final_rows_with_sort:
         print("Aucun trade clôturé (anormal).")
 
-    # Expectancy R
     expectancy_R = (sum(r_list) / len(r_list)) if r_list else 0.0
 
     if SHOW_MONTHLY:
@@ -929,25 +847,37 @@ def run_all(conn,
 def load_session_file(path: str) -> List[Tuple[str, str, str, Dict[int, bool]]]:
     """
     Lit un fichier CSV avec header:
-      SESSION,PAIR,TP,MON,TUE,WED,THU,FRI
+      SESSION,PAIR,TP[,TYPE][,MON,TUE,WED,THU,FRI]
 
     Retourne une liste de tuples:
       (session, pair, tp_level, allowed_by_wd)
-    où allowed_by_wd est un dict: {0:Mon .. 6:Sun} -> bool
+
+    Side-effect: remplit TYPE_OVERRIDE[{PAIR}] = TYPE si présent.
     """
     out: List[Tuple[str, str, str, Dict[int, bool]]] = []
     if not os.path.exists(path):
         print(f"Erreur: {path} introuvable.")
         return out
 
+    global TYPE_OVERRIDE
+    TYPE_OVERRIDE.clear()
+
     with open(path, "r", newline="") as f:
         reader = csv.DictReader(f)
+        has_type_col = "TYPE" in (reader.fieldnames or [])
+
         for rec in reader:
             sess = (rec.get("SESSION") or "").strip().upper()
             pair = (rec.get("PAIR") or "").strip().upper()
             tp   = (rec.get("TP") or "TP3").strip().upper()
             if not sess or not pair or tp not in ("TP1","TP2","TP3"):
                 continue
+
+            # Optional TYPE override
+            if has_type_col:
+                typ = (rec.get("TYPE") or "").strip().upper()
+                if typ in ("FOREX","METAL","INDEX","CRYPTO"):
+                    TYPE_OVERRIDE[pair] = typ  # used by instrument_type_for()
 
             def yes(x): return (x or "").strip().upper().startswith("Y")
             allowed_by_wd = {
@@ -963,12 +893,11 @@ def load_session_file(path: str) -> List[Tuple[str, str, str, Dict[int, bool]]]:
             out.append((sess, pair, tp, allowed_by_wd))
     return out
 
-
 # ---------- CLI ----------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--session-file", default="session_pairs.txt",
-                    help="Fichier avec lignes SESSION,PAIR,TPx (ex: NY,EURUSD,TP1)")
+                    help="Fichier avec lignes SESSION,PAIR,TP[,TYPE][,MON,TUE,WED,THU,FRI]")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date", default="2025-12-31")
     ap.add_argument("--capital-start", type=float, default=100000.0, help="Capital initial (déf. 100000)")
@@ -976,12 +905,12 @@ def main():
     ap.add_argument("--fee-per-lot", type=float, default=FEE_PER_LOT,
                     help=f"Frais USD par lot par transaction (déf. {FEE_PER_LOT})")
     ap.add_argument("--min-stop-pips", type=float, default=MIN_STOP_PIPS,
-                    help=f"Seuil minimum de stop en pips pour accepter un trade (déf. {MIN_STOP_PIPS})")
+                    help=f"Seuil minimum de stop en pips (tick_size units) pour accepter un trade (déf. {MIN_STOP_PIPS})")
     a = ap.parse_args()
 
     session_pairs = load_session_file(a.session_file)
     if not session_pairs:
-        print("Aucune ligne valide dans le fichier de sessions (SESSION,PAIR,TPx).")
+        print("Aucune ligne valide dans le fichier de sessions (SESSION,PAIR,TP[,...]).")
         sys.exit(0)
 
     pairs_list = ", ".join(sorted({p for _, p, _, __ in session_pairs}))
