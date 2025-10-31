@@ -110,27 +110,32 @@ def session_signal_window(session:str, d:date)->Tuple[int,int]:
     if s=="LONDON": return london_signal_window(d)
     return ny_signal_window(d)
 
+
 # ---------- Sessions file ----------
 def _yes(x:str)->bool: return (x or "").strip().upper().startswith("Y")
-def load_session_file(path="session_pairs.txt")->List[Tuple[str,str,str,Dict[int,bool]]]:
-    out=[]
+def load_session_file(path="session_pairs_5ers.txt") -> List[Tuple[str, str, str, Dict[int, bool]]]:
+    out = []
     if not os.path.exists(path):
         L(f"[ERR] session file '{path}' not found"); return out
-    with open(path,"r",newline="") as f:
-        reader=csv.DictReader(f)
+    with open(path, "r", newline="") as f:
+        reader = csv.DictReader(f)
         for rec in reader:
-            sess=(rec.get("SESSION") or "").strip().upper()
-            pair=(rec.get("PAIR") or "").strip().upper()
-            tp  =(rec.get("TP") or "TP3").strip().upper()
-            if sess in ("NEWYORK","NEW_YORK"): sess="NY"
-            if sess not in ("TOKYO","LONDON","NY"): continue
-            if tp not in ("TP1","TP2","TP3"): continue
-            allowed={
-                0:_yes(rec.get("MON")), 1:_yes(rec.get("TUE")),
-                2:_yes(rec.get("WED")), 3:_yes(rec.get("THU")),
-                4:_yes(rec.get("FRI")), 5:False, 6:False
+            sess = (rec.get("SESSION") or "").strip().upper()
+            _type = (rec.get("TYPE") or "").strip().upper()  # ← ignoré
+            pair = (rec.get("PAIR") or "").strip().upper()
+            tp   = (rec.get("TP") or "TP3").strip().upper()
+
+            # compat: alias de session
+            if sess in ("NEWYORK", "NEW_YORK"): sess = "NY"
+            if sess not in ("TOKYO", "LONDON", "NY"): continue
+            if tp not in ("TP1", "TP2", "TP3"): continue
+
+            allowed = {
+                0: _yes(rec.get("MON")), 1: _yes(rec.get("TUE")),
+                2: _yes(rec.get("WED")), 3: _yes(rec.get("THU")),
+                4: _yes(rec.get("FRI")), 5: False, 6: False
             }
-            out.append((sess,pair,tp,allowed))
+            out.append((sess, pair, tp, allowed))
     return out
 
 # ---------- DB ----------
