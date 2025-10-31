@@ -110,53 +110,14 @@ def session_signal_window(session:str, d:date)->Tuple[int,int]:
     if s=="LONDON": return london_signal_window(d)
     return ny_signal_window(d)
 
-# ====================== NEW: TYPE overrides + class defaults ======================
-# A) TYPE override from session file (no tuple shape change elsewhere)
-TYPE_OVERRIDE: Dict[str, str] = {}  # {"XAUUSD": "METAL", "NAS100": "INDEX", ...}
-
-def instrument_type_for(symbol:str)->str:
-    s=(symbol or "").upper()
-    t=TYPE_OVERRIDE.get(s)
-    if t in ("FOREX","METAL","INDEX","CRYPTO"): return t
-    if s in ("XAUUSD","XAGUSD","XPTUSD","XPDUSD"): return "METAL"
-    if any(s.startswith(p) for p in ("US30","US500","SP500","NAS100","DAX40","GER40","UK100","FRA40","JP225","JPN225","HK50","AUS200","ES35","IT40","CN50")):
-        return "INDEX"
-    if any(s.startswith(p) for p in ("BTC","ETH","LTC","XRP")) or s in ("BTCUSD","ETHUSD"):
-        return "CRYPTO"
-    return "FOREX"
-
-# B) Class defaults (same esprit que le backtest ; pas de table par symbole)
-CLASS_DEFAULTS = {
-    "FOREX":  {"tick_size": 0.0001, "tick_size_jpy": 0.01, "contract_size": 100_000.0, "point_value_usd_per_lot": None},
-    "METAL":  {"tick_size": 0.01,   "contract_size": 100.0, "point_value_usd_per_lot": 1.0},   # $1 per 0.01
-    "INDEX":  {"tick_size": 1.0,    "contract_size": 1.0,   "point_value_usd_per_lot": 1.0},   # $1 per 1.0
-    "CRYPTO": {"tick_size": 0.01,   "contract_size": 1.0,   "point_value_usd_per_lot": 0.01},  # $0.01 per 0.01
-}
-
-def _class_spec(symbol:str)->Dict[str,float]:
-    typ=instrument_type_for(symbol)
-    if typ=="FOREX":
-        is_jpy=(symbol or "").upper().endswith("JPY")
-        return {
-            "tick_size": CLASS_DEFAULTS["FOREX"]["tick_size_jpy"] if is_jpy else CLASS_DEFAULTS["FOREX"]["tick_size"],
-            "contract_size": CLASS_DEFAULTS["FOREX"]["contract_size"],
-            "point_value_usd_per_lot": None
-        }
-    d=CLASS_DEFAULTS[typ]
-    return {"tick_size": d["tick_size"], "contract_size": d["contract_size"], "point_value_usd_per_lot": d["point_value_usd_per_lot"]}
-# ================================================================================
-
 # ---------- Sessions file ----------
 def _yes(x:str)->bool: return (x or "").strip().upper().startswith("Y")
-def load_session_file(path="session_pairs_5ers.txt")->List[Tuple[str,str,str,Dict[int,bool]]]:
+def load_session_file(path="session_pairs.txt")->List[Tuple[str,str,str,Dict[int,bool]]]:
     out=[]
     if not os.path.exists(path):
         L(f"[ERR] session file '{path}' not found"); return out
-    # --- NEW: clear TYPE overrides each load
-    TYPE_OVERRIDE.clear()
     with open(path,"r",newline="") as f:
         reader=csv.DictReader(f)
-        has_type = "TYPE" in (reader.fieldnames or [])
         for rec in reader:
             sess=(rec.get("SESSION") or "").strip().upper()
             pair=(rec.get("PAIR") or "").strip().upper()
@@ -164,13 +125,6 @@ def load_session_file(path="session_pairs_5ers.txt")->List[Tuple[str,str,str,Dic
             if sess in ("NEWYORK","NEW_YORK"): sess="NY"
             if sess not in ("TOKYO","LONDON","NY"): continue
             if tp not in ("TP1","TP2","TP3"): continue
-
-            # --- NEW: read TYPE override (without changing return tuple)
-            if has_type:
-                t=(rec.get("TYPE") or "").strip().upper()
-                if t in ("FOREX","METAL","INDEX","CRYPTO"):
-                    TYPE_OVERRIDE[pair]=t
-
             allowed={
                 0:_yes(rec.get("MON")), 1:_yes(rec.get("TUE")),
                 2:_yes(rec.get("WED")), 3:_yes(rec.get("THU")),
@@ -424,7 +378,7 @@ def round_volume(vol:float,symbol:str)->float:
     steps=int(vol/step); v=max(vmin, min(steps*step, vmax))
     return round(v, 3)
 
-# ---- NEW helpers for FX conversion used by fallback ----
+# ---- NEW small helpers (used ONLY by the fallback sizing) ----
 def _ccy_mid(symbol: str) -> Optional[float]:
     s = mt5.symbol_info(symbol)
     t = mt5.symbol_info_tick(symbol) if s else None
@@ -449,75 +403,48 @@ def _fx_rate(ccy_from: str, ccy_to: str) -> Optional[float]:
     return None
 # ---- end NEW helpers ----
 
-# ------------------- MODIFIED: TYPE-aware fallback lot sizing -------------------
 def calc_lots(symbol:str, risk_frac:float, entry:float, sl:float)->Optional[float]:
     ai=mt5.account_info()
     if not ai: return None
     equity=float(ai.equity)
     capital = equity if USE_EQUITY_FOR_RISK else float(ai.margin_free)
-
-    # 1) Preferred path: exact risk via MT5
     risk_per_lot=_risk_usd_per_lot(symbol,entry,sl)
-
-    # 2) Fallback path: TYPE-aware, class defaults + account currency conversion
     if not risk_per_lot or risk_per_lot<=0:
+        # --- MODIFIED fallback: convert QUOTE -> account currency ---
+        si = mt5.symbol_info(symbol); 
+        if not si: return None
         acct_ccy = str(getattr(ai, "currency", "USD") or "USD").upper()
-        typ = instrument_type_for(symbol)
-        spec = _class_spec(symbol)
-        tick = spec["tick_size"]
-        contract = spec["contract_size"]
-        pv_usd = spec["point_value_usd_per_lot"]  # None for FOREX
+        base = symbol[:3].upper()
+        quote = symbol[3:6].upper()
 
-        dist_points = abs(entry - sl) / max(tick, 1e-12)
-        if dist_points <= 0:
+        pipsz = pip_size_for(symbol)
+        contract = float(si.trade_contract_size or 100000.0)
+
+        # pip value per lot in QUOTE currency
+        pip_value_quote = contract * pipsz
+
+        # SL distance in pips
+        sl_pips = abs(entry - sl) / max(pipsz, 1e-12)
+        if sl_pips <= 0: 
             return None
 
-        if typ == "FOREX":
-            # pip value per lot in QUOTE ccy = contract * tick
-            base = symbol[:3].upper()
-            quote = symbol[3:6].upper()
-            pip_val_quote = contract * tick
-
-            # convert QUOTE -> account currency
-            if quote != acct_ccy:
-                rate = _fx_rate(quote, acct_ccy)  # 1 QUOTE => ? acct_ccy
-                if not rate or rate <= 0:
-                    return None
-                pip_val_acct = pip_val_quote * rate
-            else:
-                pip_val_acct = pip_val_quote
-
-            risk_per_lot = pip_val_acct * dist_points
-
+        # convert QUOTE -> account currency
+        if quote != acct_ccy:
+            rate = _fx_rate(quote, acct_ccy)  # 1 QUOTE => ? acct_ccy
+            if not rate or rate <= 0: 
+                return None
+            pip_value_acct = pip_value_quote * rate
         else:
-            # METAL / INDEX / CRYPTO
-            # class default point value is in USD per 'tick' (tick_size unit)
-            if pv_usd is None:
-                # should not happen for non-FX, but keep a safe fallback
-                pv_usd = contract * tick
+            pip_value_acct = pip_value_quote
 
-            # convert USD -> account currency if needed
-            if acct_ccy != "USD":
-                rate = _fx_rate("USD", acct_ccy)  # 1 USD => ? acct_ccy
-                if not rate or rate <= 0:
-                    return None
-                pv_acct = pv_usd * rate
-            else:
-                pv_acct = pv_usd
-
-            risk_per_lot = pv_acct * dist_points
-
-    if not risk_per_lot or risk_per_lot <= 0:
-        return None
+        risk_per_lot = pip_value_acct * sl_pips
+        # --- end MODIFIED fallback ---
 
     lots_risk = max(0.0, capital*risk_frac)/risk_per_lot
-
     notion_per_lot=_notional_usd_per_lot(symbol) or 0.0
     lots_lev = (equity*MAX_LEVERAGE)/notion_per_lot if notion_per_lot>0 else lots_risk
-
     lots = min(lots_risk, lots_lev)
     return round_volume(max(0.0,lots), symbol)
-# -------------------------------------------------------------------------------
 
 def ensure_stop_type_and_distances(symbol:str, side:str, entry:float, sl:float, tp:float)->Tuple[float,float,float,str]:
     si=mt5.symbol_info(symbol); tick=mt5.symbol_info_tick(symbol)
@@ -719,7 +646,7 @@ def reconcile_with_mt5(conn, pair:str, today:date):
                 cur.execute(f"""UPDATE {live_tbl()} SET order_status='CANCELLED', updated_at=NOW()
                                 WHERE pair=%s AND trade_date=%s""",(pair,today)); conn.commit()
 
-            # >>> fenêtre over → aligne status CANCELLED
+            # >>> NEW: si la fenêtre est finie (ou finissable via la dernière 15m), on aligne aussi "status"
             try:
                 sess = (row.get("session") or "NY").upper()
                 s_ms, e_ms = session_signal_window(sess, today)
@@ -728,17 +655,15 @@ def reconcile_with_mt5(conn, pair:str, today:date):
 
                 window_is_over = (now_ms >= e_ms) or (last_15m + FIFTEEN_MS >= e_ms)
                 if window_is_over:
+                    # sécurité: on s'assure qu'aucun pending ne reste côté MT5
                     cancel_pending_mt5_order_if_any(conn, pair, today)
+                    # on aligne la colonne "status" du modèle
                     mark_outcome(conn, pair, today, e_ms, "CANCELLED")
             except Exception:
                 traceback.print_exc()
 
-# ---------- Core ----------
-def compute_tp(entry:float, sl:float, side:str, tp_level:str)->float:
-    k = 1 if tp_level.upper()=="TP1" else 2 if tp_level.upper()=="TP2" else 3
-    r = abs(entry - sl)
-    return round(entry + k*r, 10) if side.upper()=="LONG" else round(entry - k*r, 10)
 
+# ---------- Core ----------
 def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     upsert_base_row(conn, pair, today, session, tp_level)
     row = fetch_core(conn, pair, today)
@@ -804,6 +729,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                         (round_price(pair, entry_v), round_price(pair, sl_v), pair, today))
             conn.commit()
 
+    # helper: decide if candidate SL should replace current SL (only by comparing to current SL, not entry)
     def should_update_sl(side:str, cur_sl:Optional[float], bar_low:float, bar_high:float)->Optional[float]:
         if cur_sl is None:
             return bar_low if side=="LONG" else bar_high
@@ -812,6 +738,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         else:
             return bar_high if bar_high > cur_sl else None
 
+    # helper: apply READY updates & MT5 when SL changes in READY
     def sync_ready(entry_v: float, sl_new: float):
         entry_r = round_price(pair, entry_v)
         sl_r = round_price(pair, sl_new)
@@ -828,20 +755,21 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
 
             if new_lots is None or new_lots <= 0:
                 if oid:
-                    modify_stop_order(int(oid), entry_r, sl_r, tp_r)
+                    modify_stop_order(int(oid), entry_r, sl_r, tp_r)  # throttled
                 return
 
             if not oid:
-                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)
+                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)  # throttled (via place)
                 return
 
             si = mt5.symbol_info(pair); step = float(si.volume_step) if si else 0.01
             same_volume = abs(new_lots - prev_lots) < (step/2.0)
             if same_volume:
-                modify_stop_order(int(oid), entry_r, sl_r, tp_r)
+                modify_stop_order(int(oid), entry_r, sl_r, tp_r)  # throttled
             else:
-                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)
+                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)  # throttled (via place)
 
+    # state
     row = fetch_core(conn, pair, today)
     side = (row["side"] or "").upper() if row["side"] else None
     status = (row["status"] or "").upper() if row["status"] else None
@@ -908,22 +836,33 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         # --- Phase A: NOT READY (tracking)
         if st is None or st == "":
             if side == "LONG":
+                # Only update on NEW HH: entry = bar high, SL = bar low
                 if entry_base is None or h > entry_base:
                     entry_base = h
-                    sl_base = l
-            else:
+                    sl_base = l  # anchor = low of the bar that made the HH
+                # else: no change to SL here (we do NOT trail without a new HH)
+
+            else:  # SHORT
+                # Only update on NEW LL: entry = bar low, SL = bar high
                 if entry_base is None or l < entry_base:
                     entry_base = l
-                    sl_base = h
+                    sl_base = h  # anchor = high of the bar that made the LL
+                # else: no change to SL here (we do NOT trail without a new LL)
 
             update_base_entry_sl(entry_base, sl_base)
 
-            if (c < o) if side=="LONG" else (c > o):
+            # pullback? then freeze to READY
+            if antagonistic(o, c, side):
                 entry_frozen = round_price(pair, entry_base)
+
+                # NEW: Pullback rule
+                # LONG  -> SL = min(low at last HH bar, pullback low)
+                # SHORT -> SL = max(high at last LL bar, pullback high)
                 if side == "LONG":
                     sl_start = round_price(pair, min(sl_base, l))
-                else:
+                else:  # SHORT
                     sl_start = round_price(pair, max(sl_base, h))
+
                 tp_r = round_price(pair, compute_tp(entry_frozen, sl_start, side, row_cur["tp_level"]))
 
                 mark_pullback(conn, pair, today, ts, float(sl_start),
@@ -941,10 +880,14 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                                      ("PLACED" if ok else "REJECTED"), pair, today)); conn.commit()
                 bump_last_processed(conn, pair, today, ts); continue
 
-        # --- Phase B: READY
+        # --- Phase B: READY — trail SL only if bar extends vs current SL
         if st == "READY":
-            cand = (l if side=="LONG" else h)
-            if (cur_sl is None) or (side=="LONG" and cand < cur_sl) or (side=="SHORT" and cand > cur_sl):
+            if side == "LONG":
+                cand = should_update_sl("LONG", cur_sl, l, h)
+            else:
+                cand = should_update_sl("SHORT", cur_sl, l, h)
+
+            if cand is not None and round_price(pair, cand) != round_price(pair, cur_sl):
                 sync_ready(cur_entry, cand)
 
             if ENABLE_TRADING and MT5_ENABLED and mt5_initialize():
@@ -958,6 +901,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                 if pos and st != "TRIGGERED":
                     mark_triggered(conn, pair, today, ts)
 
+        # post-check outcome
         row_now = fetch_core(conn, pair, today)
         st_now = (row_now["status"] or "").upper() if row_now and row_now["status"] else None
         if ENABLE_TRADING and MT5_ENABLED and st_now == "TRIGGERED":
@@ -975,13 +919,18 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     row_end = fetch_core(conn, pair, today)
     st_end = (row_end["status"] or "").upper() if row_end and row_end["status"] else None
 
+    # fenêtre considérée close quand la dernière 15m dispo + 15 min >= e_ms
     if (latest_15m_open_ts_for_pair(conn, pair) or 0) + FIFTEEN_MS >= e_ms:
+        # cas 1 : jamais déclenché -> on nettoie et on marque CANCELLED
         if st_end in (None, "", "READY"):
             if ENABLE_TRADING and MT5_ENABLED and mt5_initialize():
                 cancel_pending_mt5_order_if_any(conn, pair, today)
             mark_outcome(conn, pair, today, e_ms, "CANCELLED")
+        # cas 2 : TRIGGERED -> NE RIEN FAIRE (on laisse MT5 décider WIN/LOSS)
+        # cas 3 : terminal (WIN/LOSS/CANCELLED) -> NE RIEN FAIRE
         return
 
+# ---------- Main loop ----------
 # ---------- Main loop ----------
 def main():
     try:
@@ -990,6 +939,7 @@ def main():
             if ENABLE_TRADING and MT5_ENABLED: mt5_initialize()
             while True:
                 try:
+                    # NEW: reset per-loop throttle counter
                     global _SENDS_THIS_LOOP
                     _SENDS_THIS_LOOP = 0
 
@@ -1005,6 +955,7 @@ def main():
                         if not allowed.get(today.weekday(), False):
                             continue
 
+                        # --- NEW: réconcilier aussi les jours précédents (positions encore ouvertes)
                         for delta in range(0, 3):  # today, today-1, today-2
                             d = today - timedelta(days=delta)
                             try:
@@ -1013,6 +964,7 @@ def main():
                                 L(f"[MT5-RECONCILE-ERR] {pair} d={d}: {e}")
                                 traceback.print_exc()
 
+                        # --- process_pair UNIQUEMENT pour aujourd'hui (logique intra-fenêtre)
                         s_ms, e_ms = session_signal_window(sess, today)
                         if not (s_ms <= now_ms < e_ms + FIFTEEN_MS):
                             continue
