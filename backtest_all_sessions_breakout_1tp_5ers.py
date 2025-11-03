@@ -41,7 +41,7 @@ SHOW_WEEKDAYS = True    # Afficher le breakdown par jour de la semaine
 # Skip a trade if stop size < MIN_STOP_PIPS (consumes the session/pair/day anyway)
 MIN_STOP_PIPS = 0.0
 # Fees in USD per lot per transaction (entry and exit are both charged)
-FEE_PER_LOT   = 2.5
+FEE_PER_LOT   = 2.25
 # -----------------------------
 
 UTC = timezone.utc
@@ -900,7 +900,7 @@ def main():
                     help="Fichier avec lignes SESSION,PAIR,TP[,TYPE][,MON,TUE,WED,THU,FRI]")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date", default="2025-12-31")
-    ap.add_argument("--capital-start", type=float, default=100000.0, help="Capital initial (déf. 100000)")
+    ap.add_argument("--capital-start", type=float, default=100000, help="Capital initial (déf. 100000)")
     ap.add_argument("--risk-pct", type=float, default=1.0, help="Risque par trade en % du capital disponible")
     ap.add_argument("--fee-per-lot", type=float, default=FEE_PER_LOT,
                     help=f"Frais USD par lot par transaction (déf. {FEE_PER_LOT})")

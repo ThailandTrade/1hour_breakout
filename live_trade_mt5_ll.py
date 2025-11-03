@@ -860,13 +860,16 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
             if antagonistic(o, c, side):
                 entry_frozen = round_price(pair, entry_base)
 
-                # NEW: Pullback rule
-                # LONG  -> SL = min(low at last HH bar, pullback low)
-                # SHORT -> SL = max(high at last LL bar, pullback high)
+                # --- NEW: comparer au SL EN BASE (si None → fallback sur sl_base puis sur la bougie courante)
+                # cur_sl = SL actuel en base (row_cur["sl"]) déjà récupéré un peu plus haut
+                base_sl = cur_sl if (cur_sl is not None) else (sl_base if sl_base is not None else (l if side=="LONG" else h))
+
                 if side == "LONG":
-                    sl_start = round_price(pair, min(sl_base, l))
+                    # règle: min(SL_en_base, low_pullback)
+                    sl_start = round_price(pair, min(base_sl, l))
                 else:  # SHORT
-                    sl_start = round_price(pair, max(sl_base, h))
+                    # règle: max(SL_en_base, high_pullback)
+                    sl_start = round_price(pair, max(base_sl, h))
 
                 tp_r = round_price(pair, compute_tp(entry_frozen, sl_start, side, row_cur["tp_level"]))
 
@@ -884,6 +887,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                                     (RISK_PERCENT, lots, oid, reqid, otype,
                                      ("PLACED" if ok else "REJECTED"), pair, today)); conn.commit()
                 bump_last_processed(conn, pair, today, ts); continue
+
 
         # --- Phase B: READY — trail SL only if bar extends vs current SL
         if st == "READY":
