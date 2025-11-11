@@ -17,7 +17,7 @@ Logic:
 - One row per (pair, date); Status: READY, TRIGGERED, WIN, LOSS, CANCELLED
 """
 
-import os, sys, time, csv, traceback, random
+import os, sys, time, csv, traceback
 from datetime import datetime, timedelta, timezone, date
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -34,9 +34,9 @@ PG_HOST=os.getenv("PG_HOST","127.0.0.1"); PG_PORT=int(os.getenv("PG_PORT","5432"
 PG_DB=os.getenv("PG_DB","postgres"); PG_USER=os.getenv("PG_USER","postgres")
 PG_PASS=os.getenv("PG_PASSWORD","postgres"); PG_SSLMODE=os.getenv("PG_SSLMODE","disable")
 
-POLL_SECONDS=int(os.getenv("POLL_SECONDS","15"))
+POLL_SECONDS=int(os.getenv("POLL_SECONDS","1"))
 ENABLE_TRADING=os.getenv("ENABLE_TRADING","true").lower() in ("1","true","yes","y")
-RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.05"))/100.0
+RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.1"))/100.0
 USE_EQUITY_FOR_RISK=os.getenv("USE_EQUITY_FOR_RISK","true").lower() in ("1","true","yes","y")
 COMMENT_TAG=os.getenv("COMMENT_TAG","LIVE_BPULL")
 ALLOWED_DEV_POINTS=int(os.getenv("ALLOWED_DEVIATION_POINTS","20"))
@@ -44,10 +44,6 @@ BROKER_MIN_DIST_BUF_PTS=int(os.getenv("BROKER_MIN_DISTANCE_BUFFER_POINTS","0"))
 MAX_LEVERAGE=float(os.getenv("MAX_LEVERAGE","10"))
 MIN_READY_PIPS=float(os.getenv("MIN_READY_PIPS","0"))
 FEE_PER_LOT=float(os.getenv("FEE_PER_LOT","2.5"))
-
-# --- NEW: throttle tuning via env ---
-ORDER_THROTTLE_MIN_S=int(os.getenv("ORDER_THROTTLE_MIN_SECONDS","10"))
-ORDER_THROTTLE_MAX_S=int(os.getenv("ORDER_THROTTLE_MAX_SECONDS","30"))
 
 MT5_TERMINAL_PATH=os.getenv("MT5_TERMINAL_PATH")
 MT5_LOGIN=os.getenv("MT5_LOGIN"); MT5_PASSWORD=os.getenv("MT5_PASSWORD"); MT5_SERVER=os.getenv("MT5_SERVER")
@@ -471,27 +467,17 @@ def ensure_stop_type_and_distances(symbol:str, side:str, entry:float, sl:float, 
             if (entry-tp)/p<min_pts: tp=round(entry-(min_pts*p),si.digits)
     return (round(entry,si.digits),round(sl,si.digits),round(tp,si.digits),order_type)
 
-# ---- NEW: simple per-loop throttle state ----
-_SENDS_THIS_LOOP = 0
-def _throttle_before_send(kind:str, symbol:str):
-    """Sleep randomly (10–30s by default) if this loop already sent something."""
-    global _SENDS_THIS_LOOP
-    if _SENDS_THIS_LOOP > 0:
-        d = random.uniform(ORDER_THROTTLE_MIN_S, ORDER_THROTTLE_MAX_S)
-        L(f"[MT5] Throttle ({kind} {symbol}): sleeping {d:.1f}s")
-        time.sleep(d)
-
-def _count_send():
-    global _SENDS_THIS_LOOP
-    _SENDS_THIS_LOOP += 1
-# ---- end NEW ----
 
 def place_stop_order(symbol:str, side:str, entry:float, sl:float, tp:float)->Tuple[bool,Optional[int],Optional[int],str,Optional[float]]:
-    if not mt5_preflight(symbol): return (False,None,None,"preflight",None)
-    entry,sl,tp,otype=ensure_stop_type_and_distances(symbol,side,entry,sl,tp)
-    lots=calc_lots(symbol,RISK_PERCENT,entry,sl)
-    if not lots or lots<=0: return (False,None,None,"nolots",None)
-    req={
+    if not mt5_preflight(symbol): 
+        return (False,None,None,"preflight",None)
+
+    entry,sl,tp,otype = ensure_stop_type_and_distances(symbol,side,entry,sl,tp)
+    lots = calc_lots(symbol,RISK_PERCENT,entry,sl)
+    if not lots or lots <= 0: 
+        return (False,None,None,"nolots",None)
+
+    req = {
         "action": mt5.TRADE_ACTION_PENDING,
         "symbol": symbol,
         "volume": float(lots),
@@ -501,35 +487,38 @@ def place_stop_order(symbol:str, side:str, entry:float, sl:float, tp:float)->Tup
         "type_time": mt5.ORDER_TIME_GTC
     }
 
-    # NEW: throttle before placing a new order
-    _throttle_before_send("PLACE", symbol)
-    res=mt5.order_send(req)
-    _count_send()  # NEW: count this send
+    res = mt5.order_send(req)
 
-    if res is None or res.retcode!=mt5.TRADE_RETCODE_DONE:
+    if res is None or res.retcode != mt5.TRADE_RETCODE_DONE:
         L(f"[MT5] order_send failed: {None if res is None else res.retcode} / {None if res is None else res.comment}")
         return (False,None,None,"send_fail" if res else "send_none",None)
+
     L(f"[MT5] PLACED {otype} {symbol} lots={lots} entry={entry} sl={sl} tp={tp} order={res.order}")
     return (True,int(res.order),int(res.request_id),otype,float(lots))
 
+
 def modify_stop_order(order_id:int, new_price:Optional[float], new_sl:Optional[float], new_tp:Optional[float])->bool:
     os_ = mt5.orders_get(ticket=order_id)
-    if not os_: return False
-    o=os_[0]; si=mt5.symbol_info(o.symbol)
-    req={"action": mt5.TRADE_ACTION_MODIFY, "order": order_id, "symbol": o.symbol,
-         "price": o.price_open if new_price is None else round(new_price,si.digits),
-         "sl": o.sl if new_sl is None else round(new_sl,si.digits),
-         "tp": o.tp if new_tp is None else round(new_tp,si.digits),
-         "comment": COMMENT_TAG}
+    if not os_: 
+        return False
+    o = os_[0]; si = mt5.symbol_info(o.symbol)
+    req = {
+        "action": mt5.TRADE_ACTION_MODIFY,
+        "order": order_id,
+        "symbol": o.symbol,
+        "price": o.price_open if new_price is None else round(new_price, si.digits),
+        "sl": o.sl if new_sl is None else round(new_sl, si.digits),
+        "tp": o.tp if new_tp is None else round(new_tp, si.digits),
+        "comment": COMMENT_TAG
+    }
 
-    # NEW: throttle before modify
-    _throttle_before_send("MODIFY", o.symbol)
-    r=mt5.order_send(req)
-    _count_send()  # NEW: count this send
+    r = mt5.order_send(req)
 
-    ok=(r is not None and r.retcode==mt5.TRADE_RETCODE_DONE)
-    if ok: L(f"[MT5] MODIFIED order={order_id} price={req['price']} SL={req['sl']} TP={req['tp']}")
+    ok = (r is not None and r.retcode == mt5.TRADE_RETCODE_DONE)
+    if ok:
+        L(f"[MT5] MODIFIED order={order_id} price={req['price']} SL={req['sl']} TP={req['tp']}")
     return ok
+
 
 def cancel_pending_mt5_order_if_any(conn,pair:str,d:date):
     row=fetch_core(conn,pair,d)
@@ -596,6 +585,21 @@ def infer_result_from_history(order_id:int, symbol:str, tp:Optional[float], sl:O
         traceback.print_exc(); return (None,None)
 
 # ---------- MT5 reconcile (off-bars) ----------
+def reconcile_all_open_positions(conn):
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            SELECT pair, trade_date
+            FROM {live_tbl()}
+            WHERE status = 'TRIGGERED' AND closed_at IS NULL
+        """)
+        rows = cur.fetchall()
+    for pair, d in rows:
+        try:
+            reconcile_with_mt5(conn, pair, d)
+        except Exception as e:
+            L(f"[MT5-RECONCILE-OPEN-ERR] {pair} d={d}: {e}")
+
+
 def reconcile_with_mt5(conn, pair:str, today:date):
     if not (ENABLE_TRADING and MT5_ENABLED and mt5_initialize()):
             return
@@ -948,9 +952,8 @@ def main():
             if ENABLE_TRADING and MT5_ENABLED: mt5_initialize()
             while True:
                 try:
-                    # NEW: reset per-loop throttle counter
-                    global _SENDS_THIS_LOOP
-                    _SENDS_THIS_LOOP = 0
+                    # Check all positions
+                    reconcile_all_open_positions(conn)
 
                     tuples = load_session_file()
                     if not tuples:

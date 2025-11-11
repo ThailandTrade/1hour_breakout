@@ -435,7 +435,7 @@ def main():
                         fixed_hours=fixed_hours,
                         now_server_ms_fixed=now_server_ms_fixed
                     )
-            time.sleep(15)
+            time.sleep(5)
     except KeyboardInterrupt:
         print("\n[STOP] Interrupted by user.")
     finally:

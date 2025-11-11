@@ -1,0 +1,19 @@
+A vérifier :
+
+Mise à jour du low SL seulement sur bougie bear ?
+
+03/11/2025 : +3R
+
+- XAUUSD MEVED (SL dans le backtest) : +3R
+
+04/11/2025 : -5R
+
+- NZDCHF MEVED SL 0.2 pips (TP +2R dans le backtest) : -3R
+- XAUUSD MEVED ENTRY (pas pris dans le backtest) : -1R
+- BTCUSD MEVED ENTRY (pas pris dans le backtest) : -1R
+
+05/11/2025 : OK
+
+06/11/2025 : -1R
+
+- XAUUSD juste avant annulation... pas pris dans le backtest -1R

@@ -75,16 +75,56 @@ def tokyo_signal_window(d: date) -> Tuple[int, int]:
     end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)   # 05:45
     return start, end
 
+def _uk_last_sunday(year: int, month: int) -> date:
+    # returns date of last sunday of given month
+    # start from last day of month and go backwards
+    last_day = date(year, month, 1)
+    # move to first day of next month then step back one day to get last day
+    if month == 12:
+        last_day = date(year, 12, 31)
+    else:
+        last_day = date(year, month+1, 1) - timedelta(days=1)
+    # go back until sunday
+    while last_day.weekday() != 6:  # Sunday == 6
+        last_day -= timedelta(days=1)
+    return last_day
+
+def uk_is_dst(d: date) -> bool:
+    """
+    UK DST (BST) runs from last Sunday in March (inclusive) to last Sunday in October (exclusive).
+    Return True if date d is in DST (BST).
+    """
+    year = d.year
+    start = _uk_last_sunday(year, 3)   # last sunday march
+    end   = _uk_last_sunday(year, 10)  # last sunday october
+    # DST: from start (inclusive) to end (exclusive)
+    return (d >= start) and (d < end)
+
 def london_signal_window(d: date) -> Tuple[int, int]:
+    """
+    Session windows for LONDON adapted to UK DST:
+    - If DST (summer / BST): first H1 starts at 07:00 UTC (which is local 08:00 BST).
+      Scan 15m bars between 08:00 - 12:45 UTC.
+    - If non-DST (winter / GMT): first H1 starts at 08:00 UTC (local 08:00 GMT).
+      Scan 15m bars between 09:00 - 13:45 UTC.
+    Returns (start_ms, end_ms) for the 15m scanning window.
+    Note: the H1 "reference" candle is read by read_session_1h which uses the H1 start hour below.
+    """
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=8)).timestamp()*1000)                 # 08:00
-    end   = int((base + timedelta(hours=12, minutes=45)).timestamp()*1000)   # 12:45
+    if uk_is_dst(d):
+        # summer / BST
+        start = int((base + timedelta(hours=8)).timestamp()*1000)               # 08:00 UTC window start
+        end   = int((base + timedelta(hours=12, minutes=45)).timestamp()*1000)  # 12:45 UTC window end
+    else:
+        # winter / GMT
+        start = int((base + timedelta(hours=9)).timestamp()*1000)               # 09:00 UTC window start
+        end   = int((base + timedelta(hours=13, minutes=45)).timestamp()*1000)  # 13:45 UTC window end
     return start, end
 
 def ny_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 12:00
-    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 16:45
+    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 13:00
+    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 17:45
     return start, end
 
 def window_for_session(session: str, d: date) -> Tuple[int, int]:
@@ -93,6 +133,48 @@ def window_for_session(session: str, d: date) -> Tuple[int, int]:
     if s == "LONDON": return london_signal_window(d)
     if s in ("NY","NEWYORK","NEW_YORK"): return ny_signal_window(d)
     return tokyo_signal_window(d)
+
+# ---------- Read session-specific 1H reference ----------
+def read_session_1h(conn, pair: str, d: date, session: str) -> Optional[Dict]:
+    """
+    Read the H1 'reference' candle for the given session:
+    - TOKYO: first H1 = 01:00 UTC (same as previous logic)
+    - LONDON: H1 start depends on UK DST:
+        * DST (summer/BST): H1 = 07:00 UTC (local 08:00)
+        * non-DST (winter/GMT): H1 = 08:00 UTC (local 08:00)
+    - NY: first H1 = 13:00 UTC (same as previous logic if needed)
+    Returns dict with ts, open, high, low, close or None.
+    """
+    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
+    s = (session or "").strip().upper()
+    if s == "TOKYO":
+        h = 1
+    elif s == "LONDON":
+        # in summer (BST), first local 08:00 is 07:00 UTC -> we want H1 starting at 07:00 UTC
+        # user requested: first H1 at 07:00 UTC in summer, 08:00 UTC in winter.
+        if uk_is_dst(d):
+            h = 7
+        else:
+            h = 8
+    elif s in ("NY","NEWYORK","NEW_YORK"):
+        h = 13
+    else:
+        h = 1
+
+    ts_h1 = int((base + timedelta(hours=h)).timestamp()*1000)
+    t1h = table_name(pair, "1h")
+    sql = f"SELECT ts, open, high, low, close FROM {t1h} WHERE ts = %s LIMIT 1"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (ts_h1,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            ts, o, h_high, l, c = row
+            return {"ts": int(ts), "open": float(o), "high": float(h_high), "low": float(l), "close": float(c)}
+    except Exception:
+        conn.rollback()
+        return None
 
 # ---------------- Helpers ----------------
 def sanitize_pair(pair: str) -> str:
@@ -111,20 +193,6 @@ def pip_size_for(pair: str) -> float:
     return 0.01 if pair.upper().endswith("JPY") else 0.0001
 
 # ---------------- DB Readers ----------------
-def read_first_1h(conn, pair: str, d: date) -> Optional[Dict]:
-    t1h = table_name(pair, "1h")
-    day_start, _ = day_ms_bounds(d)
-    sql = f"SELECT ts, open, high, low, close FROM {t1h} WHERE ts = %s LIMIT 1"
-    try:
-        with conn.cursor() as cur:
-            cur.execute(sql, (day_start,))
-            row = cur.fetchone()
-            if not row: return None
-            ts, o, h, l, c = row
-            return {"ts": int(ts), "open": float(o), "high": float(h), "low": float(l), "close": float(c)}
-    except Exception:
-        conn.rollback(); return None
-
 def read_15m_in(conn, pair: str, start_ms: int, end_ms: int) -> List[Dict]:
     t15 = table_name(pair, "15m")
     sql = f"""
@@ -339,11 +407,10 @@ class BareTrade:
 def collect_trades_for_session(conn, pair: str, start: date, end: date, session: str) -> List[BareTrade]:
     """
     Règle: on prend AU PLUS UN trade par (paire, jour) si l'entrée est dans la fenêtre de la session.
-    **MOD TOKYO ONLY**: tant que le trade n'est pas clôturé (TP3 ou SL), on BLOQUE les jours suivants.
+    Cross-day blocking while last trade is open (behavior kept for compatibility).
     """
     trades: List[BareTrade] = []
 
-    # --- NEW: cross-day blocking while last trade is open (Tokyo-only usage) ---
     block_until_ts: Optional[int] = None  # ts de clôture (SL ou RR3) du dernier trade
 
     for d in daterange(start, end):
@@ -354,8 +421,8 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
         if block_until_ts is not None and s <= block_until_ts:
             continue
 
-        # 1) Range H1 du jour (00:00–01:00 UTC)
-        c1 = read_first_1h(conn, pair, d)
+        # 1) Range H1 de session (varie selon session; pour LONDON on prend 07:00 UTC en été / 08:00 UTC en hiver)
+        c1 = read_session_1h(conn, pair, d, session)
         if not c1:
             continue
         rh, rl = c1["high"], c1["low"]
@@ -517,7 +584,7 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pairs-file", default="pairs.txt", help="Fichier des paires (une par ligne ou CSV avec colonne pair/pairs)")
+    ap.add_argument("--pairs-file", default="pairs_5ers.txt", help="Fichier des paires (une par ligne ou CSV avec colonne pair/pairs)")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date",   default="2025-12-31")
     ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Pas de grille (fixé à 0.1)")
@@ -531,7 +598,7 @@ def main():
     d0 = parse_date(args.start_date)
     d1 = parse_date(args.end_date)
 
-    # --- TOKYO ONLY ---
+    # --- LONDON ONLY (changed per request) ---
     sessions = ["LONDON"]
 
     best_rows: List[Dict[str, Any]] = []
@@ -542,7 +609,7 @@ def main():
             if not pair:
                 continue
 
-            # 1) Collecte des trades par session (TOKYO only)
+            # 1) Collecte des trades par session (LONDON only)
             session_trades: Dict[str, List[BareTrade]] = {}
             for sess in sessions:
                 print(f"[{pair}] Collecte trades — {sess} ...")
