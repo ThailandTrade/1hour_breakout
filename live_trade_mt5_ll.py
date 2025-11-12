@@ -109,7 +109,7 @@ def session_signal_window(session:str, d:date)->Tuple[int,int]:
 
 # ---------- Sessions file ----------
 def _yes(x:str)->bool: return (x or "").strip().upper().startswith("Y")
-def load_session_file(path="session_pairs_5ers.txt") -> List[Tuple[str, str, str, Dict[int, bool]]]:
+def load_session_file(path="session_pairs_5ers_tp45.txt") -> List[Tuple[str, str, str, Dict[int, bool]]]:
     out = []
     if not os.path.exists(path):
         L(f"[ERR] session file '{path}' not found"); return out
