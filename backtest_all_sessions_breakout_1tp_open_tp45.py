@@ -5,7 +5,7 @@ New York Breakout + Pullback — Backtester multi-sessions (TP unique par paire)
 
 Règles clés :
 - Fichier session_pairs.txt : lignes "SESSION,PAIR,TPx" (ex: NY,EURUSD,TP1).
-- Chaque paire a un seul objectif : TP1 ou TP2 ou TP3.
+- Chaque paire a un seul objectif : TP1, TP2, TP3, TP4 ou TP5.
 - Outcome binaire : TP (avant SL) sinon SL.
 - R-multiple par trade : +k R si TPk atteint avant SL, sinon -1 R.
 - Sizing : risque % sur capital disponible (equity - risques ouverts).
@@ -31,7 +31,7 @@ import psycopg2
 from psycopg2 import extensions as pg_ext
 
 # ---------- TOGGLES ----------
-SHOW_TRADES       = False    # Afficher la table des trades clos
+SHOW_TRADES       = True    # Afficher la table des trades clos
 SHOW_MONTHLY      = True    # Afficher le breakdown mensuel
 SHOW_WEEKDAYS     = True    # Afficher le breakdown par jour de la semaine
 SHOW_OPEN_TRADES  = True    # Afficher aussi les trades encore ouverts (mark-to-market)
@@ -252,7 +252,7 @@ class Trade:
     entry: float
     sl: float
 
-# NEW: Pending setup (break+pullback ready, no wick yet)
+# NEW: Pending setup (break+pullback ready, no wick)
 @dataclass
 class PendingSetup:
     side: str                # "LONG" | "SHORT"
@@ -430,24 +430,24 @@ def detect_pending_setup(c15: List[Dict], range_high: float, range_low: float) -
 # ---------- Évaluation après entrée — LOGIQUE DE RÉFÉRENCE ----------
 def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
     """
-    Enregistre les timestamps de RR1/RR2/RR3/SL; stop au premier SL ou RR3.
+    Enregistre les timestamps de RR1..RR5/SL; stop au premier SL ou RR5.
     """
     eps = pip_eps_for(pair)
     entry, sl = tr.entry, tr.sl
     r = abs(entry - sl)
     if r <= 0:
-        targets = {"RR1": entry, "RR2": entry, "RR3": entry}
-        hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None, "RR2": None, "RR3": None}
-        results = {k: "SL" for k in ["RR1","RR2","RR3"]}
+        targets = {"RR1": entry, "RR2": entry, "RR3": entry, "RR4": entry, "RR5": entry}
+        hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None, "RR2": None, "RR3": None, "RR4": None, "RR5": None}
+        results = {k: "SL" for k in ["RR1","RR2","RR3","RR4","RR5"]}
         return targets, results, hit_time, None
 
     if tr.side == "LONG":
-        t1, t2, t3 = entry + 1.0*r, entry + 2.0*r, entry + 3.0*r
+        t1, t2, t3, t4, t5 = (entry + 1.0*r, entry + 2.0*r, entry + 3.0*r, entry + 4.0*r, entry + 5.0*r)
     else:
-        t1, t2, t3 = entry - 1.0*r, entry - 2.0*r, entry - 3.0*r
+        t1, t2, t3, t4, t5 = (entry - 1.0*r, entry - 2.0*r, entry - 3.0*r, entry - 4.0*r, entry - 5.0*r)
 
-    targets = {"RR1": t1, "RR2": t2, "RR3": t3}
-    hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None, "RR2": None, "RR3": None}
+    targets = {"RR1": t1, "RR2": t2, "RR3": t3, "RR4": t4, "RR5": t5}
+    hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None, "RR2": None, "RR3": None, "RR4": None, "RR5": None}
 
     future = read_15m_from(conn, pair, tr.entry_ts)
     for b in future:
@@ -457,28 +457,34 @@ def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
             rr1_hit = (h >= t1 - eps)
             rr2_hit = (h >= t2 - eps)
             rr3_hit = (h >= t3 - eps)
+            rr4_hit = (h >= t4 - eps)
+            rr5_hit = (h >= t5 - eps)
         else:
             sl_hit  = (h >= sl - eps)
             rr1_hit = (l <= t1 + eps)
             rr2_hit = (l <= t2 + eps)
             rr3_hit = (l <= t3 + eps)
+            rr4_hit = (l <= t4 + eps)
+            rr5_hit = (l <= t5 + eps)
 
         if hit_time["SL"]  is None and sl_hit:  hit_time["SL"]  = ts
         if hit_time["RR1"] is None and rr1_hit: hit_time["RR1"] = ts
         if hit_time["RR2"] is None and rr2_hit: hit_time["RR2"] = ts
         if hit_time["RR3"] is None and rr3_hit: hit_time["RR3"] = ts
+        if hit_time["RR4"] is None and rr4_hit: hit_time["RR4"] = ts
+        if hit_time["RR5"] is None and rr5_hit: hit_time["RR5"] = ts
 
-        # Arrêt au premier SL ou RR3
-        if (hit_time["SL"] is not None) or (hit_time["RR3"] is not None):
+        # Arrêt au premier SL ou RR5
+        if (hit_time["SL"] is not None) or (hit_time["RR5"] is not None):
             break
 
     results: Dict[str, str] = {}
     sl_time = hit_time["SL"]
-    for key in ["RR1","RR2","RR3"]:
+    for key in ["RR1","RR2","RR3","RR4","RR5"]:
         ttime = hit_time[key]
         results[key] = "TP" if (ttime is not None and (sl_time is None or ttime < sl_time)) else "SL"
 
-    closed_ts = sl_time if sl_time is not None else hit_time["RR3"]
+    closed_ts = sl_time if sl_time is not None else hit_time["RR5"]
     return targets, results, hit_time, closed_ts
 
 def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
@@ -489,17 +495,19 @@ def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
 # ---------- Évaluation pour TP unique — en s'appuyant sur la logique de référence ----------
 def evaluate_trade_tp_only(conn, pair: str, tr: Trade, tp_level: str):
     """
-    Utilise evaluate_trade_after_entry() pour déterminer si le TP demandé (TP1/TP2/TP3)
+    Utilise evaluate_trade_after_entry() pour déterminer si le TP demandé (TP1..TP5)
     est atteint avant SL. Renvoie (tp_price, 'TP'|'SL', closed_ts_tp_or_sl, r_mult).
     """
     targets, _results, hits, _closed_ts_ref = evaluate_trade_after_entry(conn, pair, tr)
 
     lvl = (tp_level or "").strip().upper()
-    key = "RR1" if lvl == "TP1" else "RR2" if lvl == "TP2" else "RR3"
+    key_map = {"TP1":"RR1","TP2":"RR2","TP3":"RR3","TP4":"RR4","TP5":"RR5"}
+    r_map   = {"RR1":1.0,"RR2":2.0,"RR3":3.0,"RR4":4.0,"RR5":5.0}
+    key = key_map.get(lvl, "RR3")
     tp_price = targets[key]
 
     if reached_before(hits, key):
-        return tp_price, "TP", hits[key], float(1 if key=="RR1" else 2 if key=="RR2" else 3)
+        return tp_price, "TP", hits[key], float(r_map[key])
     else:
         return tp_price, "SL", hits["SL"], -1.0
 
@@ -656,7 +664,8 @@ def run_all(conn,
     seen_sessions = set()  # 1 trade max par (SESSION, PAIR, DATE)
 
     # *** Anti-chevauchement (logique de référence) ***
-    last_close_by_key: Dict[Tuple[str, str], Optional[int]] = {}  # (session, pair) -> last_close_ts (SL ou RR3)
+    # (MAJ) base sur la clôture RÉFÉRENCE = premier SL ou RR5
+    last_close_by_key: Dict[Tuple[str, str], Optional[int]] = {}  # (session, pair) -> last_close_ts (SL ou RR5)
 
     # NEW: collecteur de setups en attente
     pending_setups_rows: List[List[Any]] = []
@@ -717,27 +726,35 @@ def run_all(conn,
             if stop_pips < min_stop_pips:
                 continue
 
-            # *** Évaluation de référence (timestamps RR/SL + closed_ts_ref = 1er SL ou RR3) ***
+            # *** Évaluation de référence (timestamps RR/SL + closed_ts_ref = 1er SL ou RR5) ***
             targets, _res, hits, closed_ts_ref = evaluate_trade_after_entry(conn, pair, tr)
 
             # *** Décision TP unique : ferme au TP demandé si avant SL, sinon SL ***
             lvl = (tp_level or "").strip().upper()
-            rr_key = "RR1" if lvl == "TP1" else "RR2" if lvl == "TP2" else "RR3"
+            rr_key = {"TP1":"RR1","TP2":"RR2","TP3":"RR3","TP4":"RR4","TP5":"RR5"}.get(lvl, "RR3")
             tp_price = targets[rr_key]
 
+            r_map = {"RR1":1.0,"RR2":2.0,"RR3":3.0,"RR4":4.0,"RR5":5.0}
             if reached_before(hits, rr_key):
                 outcome = "TP"
-                r_mult  = float(1 if rr_key=="RR1" else 2 if rr_key=="RR2" else 3)
+                r_mult  = float(r_map[rr_key])
                 closed_ts_user = hits[rr_key]
             else:
                 outcome = "SL"
                 r_mult  = -1.0
                 closed_ts_user = hits["SL"]
 
-            # Met à jour l’anti-overlap avec la clôture de RÉFÉRENCE (SL ou RR3, le premier)
-            if closed_ts_ref is not None:
-                last_close_by_key[last_key] = closed_ts_ref
+            # Anti-overlap calé sur le TP choisi : min(SL, RRk) avec k selon rr_key
+            def _min_time(a, b):
+                if a is None: return b
+                if b is None: return a
+                return a if a < b else b
+
+            closed_ts_for_overlap = _min_time(hits.get("SL"), hits.get(rr_key))
+            if closed_ts_for_overlap is not None:
+                last_close_by_key[last_key] = closed_ts_for_overlap
             else:
+                # si ni SL ni RRk touchés (trade encore “vivant”), on ne bouge pas la barrière
                 last_close_by_key[last_key] = last_close_by_key.get(last_key, None)
 
             pt = PreparedTrade(pair=pair, session=sess, tp_level=tp_level,
@@ -806,6 +823,7 @@ def run_all(conn,
         return sum(t.risk_amount for t in open_trades)
 
     final_rows_with_sort: List[Tuple[int, int, List[Any]]] = []
+
 
     for ts in sorted(evmap.keys()):
         # ENTRIES
@@ -1052,7 +1070,7 @@ def load_session_file(path: str) -> List[Tuple[str, str, str, Dict[int, bool]]]:
             sess = (rec.get("SESSION") or "").strip().upper()
             pair = (rec.get("PAIR") or "").strip().upper()
             tp   = (rec.get("TP") or "TP3").strip().upper()
-            if not sess or not pair or tp not in ("TP1","TP2","TP3"):
+            if not sess or not pair or tp not in ("TP1","TP2","TP3","TP4","TP5"):
                 continue
 
             def yes(x): return (x or "").strip().upper().startswith("Y")
@@ -1076,7 +1094,7 @@ def main():
                     help="Fichier avec lignes SESSION,PAIR,TPx (ex: NY,EURUSD,TP1)")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date", default="2025-12-31")
-    ap.add_argument("--capital-start", type=float, default=100000.0, help="Capital initial (déf. 100000)")
+    ap.add_argument("--capital-start", type=float, default=100000, help="Capital initial (déf. 100000)")
     ap.add_argument("--risk-pct", type=float, default=1.0, help="Risque par trade en % du capital disponible")
     ap.add_argument("--fee-per-lot", type=float, default=FEE_PER_LOT,
                     help=f"Frais USD par lot par transaction (déf. {FEE_PER_LOT})")

@@ -34,7 +34,7 @@ PG_HOST=os.getenv("PG_HOST","127.0.0.1"); PG_PORT=int(os.getenv("PG_PORT","5432"
 PG_DB=os.getenv("PG_DB","postgres"); PG_USER=os.getenv("PG_USER","postgres")
 PG_PASS=os.getenv("PG_PASSWORD","postgres"); PG_SSLMODE=os.getenv("PG_SSLMODE","disable")
 
-POLL_SECONDS=int(os.getenv("POLL_SECONDS","1"))
+POLL_SECONDS=int(os.getenv("POLL_SECONDS","5"))
 ENABLE_TRADING=os.getenv("ENABLE_TRADING","true").lower() in ("1","true","yes","y")
 RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.1"))/100.0
 USE_EQUITY_FOR_RISK=os.getenv("USE_EQUITY_FOR_RISK","true").lower() in ("1","true","yes","y")
@@ -124,7 +124,7 @@ def load_session_file(path="session_pairs_5ers.txt") -> List[Tuple[str, str, str
             # compat: alias de session
             if sess in ("NEWYORK", "NEW_YORK"): sess = "NY"
             if sess not in ("TOKYO", "LONDON", "NY"): continue
-            if tp not in ("TP1", "TP2", "TP3"): continue
+            if tp not in ("TP1", "TP2", "TP3", "TP4", "TP5"): continue
 
             allowed = {
                 0: _yes(rec.get("MON")), 1: _yes(rec.get("TUE")),
@@ -317,7 +317,8 @@ def read_15m_in(conn,pair:str,start_ms:int,end_ms:int)->List[Dict[str,Any]]:
 
 # ---------- TP ----------
 def compute_tp(entry:float, sl:float, side:str, tp_level:str)->float:
-    k = 1 if tp_level.upper()=="TP1" else 2 if tp_level.upper()=="TP2" else 3
+    lvl = (tp_level or "TP3").upper()
+    k = 1 if lvl == "TP1" else 2 if lvl == "TP2" else 3 if lvl == "TP3" else 4 if lvl == "TP4" else 5
     r = abs(entry - sl)
     return round(entry + k*r, 10) if side.upper()=="LONG" else round(entry - k*r, 10)
 
