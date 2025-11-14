@@ -41,7 +41,7 @@ SHOW_OPEN_SETUPS  = False   # Afficher les setups break+pullback prêts sans wic
 # Skip a trade if stop size < MIN_STOP_PIPS (consumes the session/pair/day anyway)
 MIN_STOP_PIPS = 0.0
 # Fees in USD per lot per transaction (entry and exit are both charged)
-FEE_PER_LOT   = 2.5
+FEE_PER_LOT   = 3.0
 # -----------------------------
 
 UTC = timezone.utc
@@ -1094,7 +1094,7 @@ def main():
                     help="Fichier avec lignes SESSION,PAIR,TPx (ex: NY,EURUSD,TP1)")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date", default="2025-12-31")
-    ap.add_argument("--capital-start", type=float, default=100000, help="Capital initial (déf. 100000)")
+    ap.add_argument("--capital-start", type=float, default=100, help="Capital initial (déf. 100000)")
     ap.add_argument("--risk-pct", type=float, default=1.0, help="Risque par trade en % du capital disponible")
     ap.add_argument("--fee-per-lot", type=float, default=FEE_PER_LOT,
                     help=f"Frais USD par lot par transaction (déf. {FEE_PER_LOT})")
