@@ -521,7 +521,7 @@ def modify_stop_order(order_id:int, new_price:Optional[float], new_sl:Optional[f
     return ok
 
 
-def cancel_pending_mt5_order_if_any(conn,pair:str,d:date):
+def cancel_pending_mt5_order_if_any(conn,pair:str,d:date, *, db_clear: bool = True):
     row=fetch_core(conn,pair,d)
     if not row or not row.get("mt5_order_id"): return
     oid=int(row["mt5_order_id"])
@@ -535,14 +535,15 @@ def cancel_pending_mt5_order_if_any(conn,pair:str,d:date):
             L(f"[MT5] cancel failed {None if r is None else r.retcode}")
         else:
             L(f"[MT5] CANCELLED pending order={oid}")
-    with conn.cursor() as cur:
-        cur.execute(f"""UPDATE {live_tbl()} SET order_status='CANCELLED',
-                        mt5_order_id=NULL, mt5_request_id=NULL, mt5_order_type=NULL, updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",(pair,d)); conn.commit()
+    if db_clear:
+        with conn.cursor() as cur:
+            cur.execute(f"""UPDATE {live_tbl()} SET order_status='CANCELLED',
+                            mt5_order_id=NULL, mt5_request_id=NULL, mt5_order_type=NULL, updated_at=NOW()
+                            WHERE pair=%s AND trade_date=%s""",(pair,d)); conn.commit()
 
 def replace_pending_order_with(conn, pair:str, side:str, entry:float, sl:float, tp:float, today:date):
     # cancel (not throttled), then place (throttled inside place_stop_order)
-    cancel_pending_mt5_order_if_any(conn, pair, today)
+    cancel_pending_mt5_order_if_any(conn, pair, today, db_clear=False)
     ok, oid, reqid, otype, lots = place_stop_order(pair, side, entry, sl, tp)
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET risk_pct=%s,lots=%s,
@@ -652,25 +653,24 @@ def reconcile_with_mt5(conn, pair:str, today:date):
             except Exception:
                 pending=None
         if (oid is not None) and (pending is None) and (pos is None):
-            with conn.cursor() as cur:
-                cur.execute(f"""UPDATE {live_tbl()} SET order_status='CANCELLED', updated_at=NOW()
-                                WHERE pair=%s AND trade_date=%s""",(pair,today)); conn.commit()
+            # Ne pas marquer CANCELLED ici (remplacement en cours / race condition possible)
+            pass
 
-            # >>> NEW: si la fenêtre est finie (ou finissable via la dernière 15m), on aligne aussi "status"
-            try:
-                sess = (row.get("session") or "NY").upper()
-                s_ms, e_ms = session_signal_window(sess, today)
-                last_15m = latest_15m_open_ts_for_pair(conn, pair) or 0
-                now_ms = int(datetime.now(tz=UTC).timestamp()*1000)
+        # >>> NEW: si la fenêtre est finie (ou finissable via la dernière 15m), on aligne aussi "status"
+        try:
+            sess = (row.get("session") or "NY").upper()
+            s_ms, e_ms = session_signal_window(sess, today)
+            last_15m = latest_15m_open_ts_for_pair(conn, pair) or 0
+            now_ms = int(datetime.now(tz=UTC).timestamp()*1000)
 
-                window_is_over = (now_ms >= e_ms) or (last_15m + FIFTEEN_MS >= e_ms)
-                if window_is_over:
-                    # sécurité: on s'assure qu'aucun pending ne reste côté MT5
-                    cancel_pending_mt5_order_if_any(conn, pair, today)
-                    # on aligne la colonne "status" du modèle
-                    mark_outcome(conn, pair, today, e_ms, "CANCELLED")
-            except Exception:
-                traceback.print_exc()
+            window_is_over = (now_ms >= e_ms) or (last_15m + FIFTEEN_MS >= e_ms)
+            if window_is_over:
+                # sécurité: on s'assure qu'aucun pending ne reste côté MT5
+                cancel_pending_mt5_order_if_any(conn, pair, today, db_clear=True)
+                # on aligne la colonne "status" du modèle
+                mark_outcome(conn, pair, today, e_ms, "CANCELLED")
+        except Exception:
+            traceback.print_exc()
 
 
 # ---------- Core ----------

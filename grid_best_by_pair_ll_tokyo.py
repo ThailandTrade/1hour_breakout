@@ -380,28 +380,80 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
 
 # ---------------- Grille des poids (w1..w5) ----------------
 def weight_grid(step: float = 0.1):
-    # Génère toutes les combinaisons à pas 0.1 telles que w1+...+w5=1
-    vals = [round(i*step, 1) for i in range(int(1/step)+1)]
-    for w1 in vals:
-        for w2 in vals:
-            for w3 in vals:
-                for w4 in vals:
-                    w5 = round(1.0 - w1 - w2 - w3 - w4, 1)
-                    if w5 < -1e-9:
-                        continue
-                    s = w1 + w2 + w3 + w4 + w5
-                    if abs(s - 1.0) <= 1e-9 and (0.0 <= w5 <= 1.0):
-                        yield (w1, w2, w3, w4, w5)
+    # Full TP only: (1,0,0,0,0) .. (0,0,0,0,1)
+    options = [
+        (1.0, 0.0, 0.0, 0.0, 0.0),  # full TP1
+        (0.0, 1.0, 0.0, 0.0, 0.0),  # full TP2
+        (0.0, 0.0, 1.0, 0.0, 0.0),  # full TP3
+        (0.0, 0.0, 0.0, 1.0, 0.0),  # full TP4
+        (0.0, 0.0, 0.0, 0.0, 1.0),  # full TP5
+    ]
+    for w1, w2, w3, w4, w5 in options:
+        yield (w1, w2, w3, w4, w5)
+        
+# ---------------- Impression format session-file ----------------
+# ---------------- Impression format session-file ----------------
+def print_session_csv(rows: List[Dict[str, Any]]):
+    """
+    Génère un CSV au format :
+    SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI
+
+    Basé sur le même filtre que "paires à trader actuellement" :
+      - trades > 0
+      - PF >= 1.5
+      - MDD_R < 8
+    """
+    # Filtre identique à print_simple_tp_table
+    selected: List[Dict[str, Any]] = []
+    for r in rows:
+        if r["trades"] <= 0:
+            continue
+        if r["pf"] < 1.5 or r["mdd_r"] >= 8.0:
+            continue
+        selected.append(r)
+
+    # Tri par score décroissant comme le tableau simplifié
+    selected_sorted = sorted(selected, key=lambda x: x["score"], reverse=True)
+
+    print("\nSESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
+    for r in selected_sorted:
+        # TP cible en fonction du poids
+        if abs(r["w1"] - 1.0) < 1e-9:
+            tp = "TP1"
+        elif abs(r["w2"] - 1.0) < 1e-9:
+            tp = "TP2"
+        elif abs(r["w3"] - 1.0) < 1e-9:
+            tp = "TP3"
+        elif abs(r["w4"] - 1.0) < 1e-9:
+            tp = "TP4"
+        else:
+            tp = "TP5"
+
+        # TYPE — ton script ne stocke pas les types → on met FOREX par défaut
+        typ = "FOREX"
+
+        print(f"{r['session']},{typ},{r['pair']},{tp},Y,Y,Y,Y,Y")
+
 
 # ---------------- Stats pour une combinaison ----------------
 def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float, w4: float, w5: float) -> Dict[str, Any]:
     total = len(trades)
     if total == 0:
-        return {"trades": 0, "winrate": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "exp": 0.0,
-                "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0, "p5": 0.0}
+        return {
+            "trades": 0,
+            "winrate": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "exp": 0.0,
+            "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0, "p5": 0.0,
+            "pf": 0.0,
+            "mdd_r": 0.0,
+            "score": 0.0,
+        }
 
     r_wins: List[float] = []
     r_losses_abs: List[float] = []
+    r_all: List[float] = []
 
     tp1_cnt = tp2_cnt = tp3_cnt = tp4_cnt = tp5_cnt = 0
 
@@ -414,6 +466,7 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float, 
         if reached_before(hits, "RR5"): tp5_cnt += 1
 
         r_mult = compute_r_and_close(hits, w1, w2, w3, w4, w5)
+        r_all.append(r_mult)
 
         # WIN/LOSS = TP1 avant SL
         if reached_before(hits, "RR1"):
@@ -421,8 +474,9 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float, 
         else:
             r_losses_abs.append(-r_mult)
 
-    wins = len(r_wins)
+    wins   = len(r_wins)
     losses = len(r_losses_abs)
+
     winrate = (wins / total) if total > 0 else 0.0
     avg_win = (sum(r_wins)/wins) if wins > 0 else 0.0
     avg_loss = (sum(r_losses_abs)/losses) if losses > 0 else 0.0
@@ -434,9 +488,41 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float, 
     p4 = tp4_cnt / total
     p5 = tp5_cnt / total
 
+    # Profit factor
+    sum_wins   = sum(r_wins)
+    sum_losses = sum(r_losses_abs)
+    if sum_losses > 1e-9:
+        pf = sum_wins / sum_losses
+    else:
+        # quasi pas de pertes : on borne un peu
+        pf = sum_wins if sum_wins > 0 else 0.0
+
+    # Max drawdown en R sur la séquence de trades
+    equity = 0.0
+    peak   = 0.0
+    mdd_r  = 0.0
+    for r in r_all:
+        equity += r
+        if equity > peak:
+            peak = equity
+        dd = peak - equity
+        if dd > mdd_r:
+            mdd_r = dd
+
+    # Score composite (Condition 2)
+    bonus = 0.3 if winrate > 0.45 else 0.0
+    score = 2.0 * expectancy + pf - 0.5 * mdd_r + bonus
+
     return {
-        "trades": total, "winrate": winrate, "avg_win": avg_win, "avg_loss": avg_loss, "exp": expectancy,
-        "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5
+        "trades": total,
+        "winrate": winrate,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "exp": expectancy,
+        "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5,
+        "pf": pf,
+        "mdd_r": mdd_r,
+        "score": score,
     }
 
 # ---------------- Chargement des paires ----------------
@@ -478,13 +564,14 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
     except Exception:
         PrettyTable = None
 
-    rows_sorted = sorted(rows, key=lambda r: r["exp"], reverse=True)
+    rows_sorted = sorted(rows, key=lambda r: r["score"], reverse=True)
 
     if PrettyTable:
         t = PrettyTable()
         t.field_names = [
             "Pair","Session","w1","w2","w3","w4","w5",
             "Trades","Winrate","AvgWinR","AvgLossR","ExpectancyR",
+            "PF","MDD_R","Score",
             "TP1%","TP2%","TP3%","TP4%","TP5%"
         ]
         for r in rows_sorted:
@@ -497,6 +584,9 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
                 f"{r['avg_win']:.3f}R",
                 f"{r['avg_loss']:.3f}R",
                 f"{r['exp']:+.3f}R",
+                f"{r['pf']:.2f}",
+                f"{r['mdd_r']:.2f}R",
+                f"{r['score']:+.3f}",
                 f"{r['p1']*100:.2f}%",
                 f"{r['p2']*100:.2f}%",
                 f"{r['p3']*100:.2f}%",
@@ -507,7 +597,7 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
         print(t)
         print("==========================================================")
     else:
-        print("\nPair\tSession\tw1\tw2\tw3\tw4\tw5\tTrades\tWinrate\tAvgWinR\tAvgLossR\tExpectancyR\tTP1%\tTP2%\tTP3%\tTP4%\tTP5%")
+        print("\nPair\tSession\tw1\tw2\tw3\tw4\tw5\tTrades\tWinrate\tAvgWinR\tAvgLossR\tExpectancyR\tPF\tMDD_R\tScore\tTP1%\tTP2%\tTP3%\tTP4%\tTP5%")
         for r in rows_sorted:
             print("\t".join([
                 r["pair"], r["session"],
@@ -517,6 +607,9 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
                 f"{r['avg_win']:.3f}",
                 f"{r['avg_loss']:.3f}",
                 f"{r['exp']:+.3f}",
+                f"{r['pf']:.2f}",
+                f"{r['mdd_r']:.2f}",
+                f"{r['score']:+.3f}",
                 f"{r['p1']*100:.2f}%",
                 f"{r['p2']*100:.2f}%",
                 f"{r['p3']*100:.2f}%",
@@ -524,6 +617,76 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
                 f"{r['p5']*100:.2f}%"
             ]))
         print("==========================================================")
+
+# ---------------- Tableau simplifié final (pair / TP cible) ----------------
+def print_simple_tp_table(rows: List[Dict[str, Any]]):
+    """
+    Tableau final simplifié des paires à trader :
+      - PF >= 1.5
+      - MDD_R < 8
+    Colonnes: Pair / Session / TP cible / Trades / ExpectancyR / PF / MDD_R
+    """
+    try:
+        from prettytable import PrettyTable
+    except Exception:
+        PrettyTable = None
+
+    selected: List[Dict[str, Any]] = []
+    for r in rows:
+        if r["trades"] <= 0:
+            continue
+        if r["pf"] < 1.5 or r["mdd_r"] >= 8.0:
+            continue
+
+        # Déterminer le TP cible en fonction du poids
+        tp = "-"
+        if abs(r["w1"] - 1.0) < 1e-9:
+            tp = "TP1"
+        elif abs(r["w2"] - 1.0) < 1e-9:
+            tp = "TP2"
+        elif abs(r["w3"] - 1.0) < 1e-9:
+            tp = "TP3"
+        elif abs(r["w4"] - 1.0) < 1e-9:
+            tp = "TP4"
+        elif abs(r["w5"] - 1.0) < 1e-9:
+            tp = "TP5"
+
+        r2 = dict(r)
+        r2["tp"] = tp
+        selected.append(r2)
+
+    selected_sorted = sorted(selected, key=lambda x: x["score"], reverse=True)
+
+    if PrettyTable:
+        t = PrettyTable()
+        t.field_names = ["Pair", "Session", "TP", "Trades", "ExpectancyR", "PF", "MDD_R"]
+        for r in selected_sorted:
+            t.add_row([
+                r["pair"],
+                r["session"],
+                r["tp"],
+                r["trades"],
+                f"{r['exp']:+.3f}R",
+                f"{r['pf']:.2f}",
+                f"{r['mdd_r']:.2f}R",
+            ])
+        print("\n===== PAIRES À TRADER ACTUELLEMENT (PF>=1.5, MDD_R<8) =====")
+        print(t)
+        print("============================================================")
+    else:
+        print("\n===== PAIRES À TRADER ACTUELLEMENT (PF>=1.5, MDD_R<8) =====")
+        print("Pair\tSession\tTP\tTrades\tExpectancyR\tPF\tMDD_R")
+        for r in selected_sorted:
+            print("\t".join([
+                r["pair"],
+                r["session"],
+                r["tp"],
+                str(r["trades"]),
+                f"{r['exp']:+.3f}",
+                f"{r['pf']:.2f}",
+                f"{r['mdd_r']:.2f}",
+            ]))
+        print("============================================================")
 
 # ---------------- Main ----------------
 def main():
@@ -572,7 +735,7 @@ def main():
                         "w1": w1, "w2": w2, "w3": w3, "w4": w4, "w5": w5,
                         **st
                     }
-                    if (best_for_pair is None) or (row["exp"] > best_for_pair["exp"]):
+                    if (best_for_pair is None) or (row["score"] > best_for_pair["score"]):
                         best_for_pair = row
 
             # 3) Empile la meilleure ligne de la paire si au moins 1 trade
@@ -584,11 +747,17 @@ def main():
                     "pair": pair, "session": "-",
                     "w1": 0.0, "w2": 0.0, "w3": 0.0, "w4": 0.0, "w5": 1.0,
                     "trades": 0, "winrate": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "exp": 0.0,
-                    "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0, "p5": 0.0
+                    "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0, "p5": 0.0,
+                    "pf": 0.0, "mdd_r": 0.0, "score": 0.0,
                 })
 
     # 4) Affichage final (1 ligne par paire)
     print_final_best_table(best_rows)
+
+    # 5) Tableau simplifié final (pair / TP cible)
+    print_simple_tp_table(best_rows)
+    
+    print_session_csv(best_rows)
 
 if __name__ == "__main__":
     main()

@@ -117,7 +117,7 @@ def parse_pairs(path: str) -> List[str]:
         for r in reader:
             p = r.get("pair") or r.get("PAIR") or r.get("Pair")
             if p:
-                pairs.append(p.strip().upper())
+                pairs.append(p.strip())
     return pairs
 
 def parse_pairs_cli(s: str) -> List[str]:
@@ -145,7 +145,7 @@ def lookback_years(tf: str) -> int:
         return 10
     if tf == "1d":
         return 4
-    return 2
+    return 1
 
 def compute_initial_start_utc(tf: str) -> datetime:
     years = lookback_years(tf)
