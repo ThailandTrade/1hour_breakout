@@ -36,7 +36,7 @@ PG_PASS=os.getenv("PG_PASSWORD","postgres"); PG_SSLMODE=os.getenv("PG_SSLMODE","
 
 POLL_SECONDS=int(os.getenv("POLL_SECONDS","5"))
 ENABLE_TRADING=os.getenv("ENABLE_TRADING","true").lower() in ("1","true","yes","y")
-RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.1"))/100.0
+RISK_PERCENT=float(os.getenv("RISK_PERCENT","0.08"))/100.0
 USE_EQUITY_FOR_RISK=os.getenv("USE_EQUITY_FOR_RISK","true").lower() in ("1","true","yes","y")
 COMMENT_TAG=os.getenv("COMMENT_TAG","LIVE_BPULL")
 ALLOWED_DEV_POINTS=int(os.getenv("ALLOWED_DEVIATION_POINTS","20"))
