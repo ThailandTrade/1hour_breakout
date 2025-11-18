@@ -14,7 +14,7 @@ Logic:
 - Pullback (antagonistic color) → READY: set SL anchor = last low/high BEFORE pullback (fixed), compute TPk from entry/SL
 - Trail (while READY & not triggered): update SL only if current bar makes a new farther extreme vs current SL (LONG: lower low; SHORT: higher high)
 - Flip allowed BEFORE TRIGGER: on opposite strict break → reset state, set new side/break_at, and continue
-- One row per (pair, date); Status: READY, TRIGGERED, WIN, LOSS, CANCELLED
+- One row per (session, pair, date); Status: READY, TRIGGERED, WIN, LOSS, CANCELLED
 """
 
 import os, sys, time, csv, traceback
@@ -182,26 +182,26 @@ def ensure_live_table(conn):
             order_status TEXT,
 
             updated_at TIMESTAMPTZ DEFAULT NOW(),
-            PRIMARY KEY (pair, trade_date)
+            PRIMARY KEY (pair, trade_date, session)
         );
         """); conn.commit()
         cur.execute(f"CREATE INDEX IF NOT EXISTS idx_live_session_status ON {live_tbl()}(session,status);"); conn.commit()
 
 def upsert_base_row(conn, pair:str, d:date, session:str, tp_level:str):
     with conn.cursor() as cur:
-        cur.execute(f"SELECT 1 FROM {live_tbl()} WHERE pair=%s AND trade_date=%s",(pair,d))
+        cur.execute(f"SELECT 1 FROM {live_tbl()} WHERE pair=%s AND trade_date=%s AND session=%s",(pair,d,session))
         ex=cur.fetchone() is not None
     if not ex:
         with conn.cursor() as cur:
             cur.execute(f"""INSERT INTO {live_tbl()}(pair,trade_date,session,tp_level,updated_at)
                             VALUES(%s,%s,%s,%s,NOW())
-                            ON CONFLICT (pair,trade_date) DO NOTHING""",(pair,d,session,tp_level)); conn.commit()
+                            ON CONFLICT (pair,trade_date,session) DO NOTHING""",(pair,d,session,tp_level)); conn.commit()
     else:
         with conn.cursor() as cur:
             cur.execute(f"""UPDATE {live_tbl()} SET session=%s,tp_level=%s,updated_at=NOW()
-                            WHERE pair=%s AND trade_date=%s""",(session,tp_level,pair,d)); conn.commit()
+                            WHERE pair=%s AND trade_date=%s AND session=%s""",(session,tp_level,pair,d,session)); conn.commit()
 
-def fetch_core(conn, pair:str, d:date)->Optional[Dict[str,Any]]:
+def fetch_core(conn, pair:str, d:date, session:str)->Optional[Dict[str,Any]]:
     with conn.cursor() as cur:
         cur.execute(f"""
         SELECT session,range_1h_at,high_1h,low_1h,break_at,side,
@@ -209,8 +209,8 @@ def fetch_core(conn, pair:str, d:date)->Optional[Dict[str,Any]]:
                entry,sl,tp,tp_level,status,
                opened_at,closed_at,
                mt5_order_id,order_status,lots,risk_pct,last_proc_15m_at
-        FROM {live_tbl()} WHERE pair=%s AND trade_date=%s
-        """,(pair,d))
+        FROM {live_tbl()} WHERE pair=%s AND trade_date=%s AND session=%s
+        """,(pair,d,session))
         r=cur.fetchone()
     if not r: return None
     (session,range_at,hh,ll,break_at,side,
@@ -226,7 +226,7 @@ def fetch_core(conn, pair:str, d:date)->Optional[Dict[str,Any]]:
                 mt5_order_id=order_id,order_status=order_status,lots=lots,risk_pct=risk_pct,
                 last_proc_15m_at=last_done)
 
-def set_range_1h_from_midnight(conn,pair:str,d:date):
+def set_range_1h_from_midnight(conn,pair:str,d:date,session:str):
     t=candles_tbl(pair,"1h")
     start_dt = datetime(d.year,d.month,d.day,tzinfo=UTC)
     start_ms = int(start_dt.timestamp()*1000)
@@ -238,54 +238,54 @@ def set_range_1h_from_midnight(conn,pair:str,d:date):
     ts,o,h,l,c=row
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET range_1h_at=%s,high_1h=%s,low_1h=%s,updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",(ms_to_dt(ts),float(h),float(l),pair,d)); conn.commit()
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",(ms_to_dt(ts),float(h),float(l),pair,d,session)); conn.commit()
     return True
 
-def mark_break(conn,pair:str,d:date,side:str,break_ms:int,init_entry:float):
+def mark_break(conn,pair:str,d:date,session:str,side:str,break_ms:int,init_entry:float):
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET side=%s,break_at=%s,entry=%s,updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",
-                    (side, ms_to_dt(break_ms), init_entry, pair, d)); conn.commit()
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",
+                    (side, ms_to_dt(break_ms), init_entry, pair, d, session)); conn.commit()
 
-def persist_entry_only(conn,pair:str,d:date,new_entry:float):
+def persist_entry_only(conn,pair:str,d:date,session:str,new_entry:float):
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET entry=%s,updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",(new_entry,pair,d)); conn.commit()
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",(new_entry,pair,d,session)); conn.commit()
 
-def mark_pullback(conn,pair:str,d:date,pull_ms:int,sl_anchor:float,entry:float,sl:float,tp:float):
+def mark_pullback(conn,pair:str,d:date,session:str,pull_ms:int,sl_anchor:float,entry:float,sl:float,tp:float):
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET pullback_at=%s,sl_anchor_since_pull=%s,
                         entry=%s,sl=%s,tp=%s,status='READY',updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",
-                    (ms_to_dt(pull_ms),sl_anchor,entry,sl,tp,pair,d)); conn.commit()
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",
+                    (ms_to_dt(pull_ms),sl_anchor,entry,sl,tp,pair,d,session)); conn.commit()
 
-def update_ready_order_values(conn,pair:str,d:date,entry:float,sl:float,tp:float, sl_anchor:Optional[float]=None):
+def update_ready_order_values(conn,pair:str,d:date,session:str,entry:float,sl:float,tp:float, sl_anchor:Optional[float]=None):
     with conn.cursor() as cur:
         if sl_anchor is None:
             cur.execute(f"""UPDATE {live_tbl()} SET entry=%s,sl=%s,tp=%s,updated_at=NOW()
-                            WHERE pair=%s AND trade_date=%s""",(entry,sl,tp,pair,d))
+                            WHERE pair=%s AND trade_date=%s AND session=%s""",(entry,sl,tp,pair,d,session))
         else:
             cur.execute(f"""UPDATE {live_tbl()} SET entry=%s,sl=%s,tp=%s,sl_anchor_since_pull=%s,updated_at=NOW()
-                            WHERE pair=%s AND trade_date=%s""",(entry,sl,tp,sl_anchor,pair,d))
+                            WHERE pair=%s AND trade_date=%s AND session=%s""",(entry,sl,tp,sl_anchor,pair,d,session))
         conn.commit()
 
-def mark_triggered(conn,pair:str,d:date,ts_ms:int):
+def mark_triggered(conn,pair:str,d:date,session:str,ts_ms:int):
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET status='TRIGGERED',opened_at=%s,updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",(ms_to_dt(ts_ms),pair,d)); conn.commit()
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",(ms_to_dt(ts_ms),pair,d,session)); conn.commit()
 
-def mark_outcome(conn,pair:str,d:date,closed_ms:int,outcome:str):
+def mark_outcome(conn,pair:str,d:date,session:str,closed_ms:int,outcome:str):
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET status=%s,closed_at=%s,updated_at=%s
-                        WHERE pair=%s AND trade_date=%s""",(outcome,ms_to_dt(closed_ms),now_iso(),pair,d)); conn.commit()
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",(outcome,ms_to_dt(closed_ms),now_iso(),pair,d,session)); conn.commit()
 
-def bump_last_processed(conn,pair:str,d:date,ts_ms:int):
+def bump_last_processed(conn,pair:str,d:date,session:str,ts_ms:int):
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET last_proc_15m_at=%s,updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",(ms_to_dt(ts_ms),pair,d)); conn.commit()
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",(ms_to_dt(ts_ms),pair,d,session)); conn.commit()
 
-def reset_state_on_flip(conn,pair:str,d:date):
-    cancel_pending_mt5_order_if_any(conn,pair,d)
+def reset_state_on_flip(conn,pair:str,d:date,session:str):
+    cancel_pending_mt5_order_if_any(conn,pair,d,session)
     with conn.cursor() as cur:
         cur.execute(f"""
             UPDATE {live_tbl()} SET
@@ -295,8 +295,8 @@ def reset_state_on_flip(conn,pair:str,d:date):
                 status=NULL, opened_at=NULL, closed_at=NULL,
                 order_status=NULL, mt5_order_id=NULL, mt5_request_id=NULL, mt5_order_type=NULL,
                 updated_at=NOW()
-            WHERE pair=%s AND trade_date=%s
-        """,(pair,d)); conn.commit()
+            WHERE pair=%s AND trade_date=%s AND session=%s
+        """,(pair,d,session)); conn.commit()
 
 # ---------- Candles ----------
 def latest_15m_open_ts_for_pair(conn,pair:str)->Optional[int]:
@@ -521,8 +521,8 @@ def modify_stop_order(order_id:int, new_price:Optional[float], new_sl:Optional[f
     return ok
 
 
-def cancel_pending_mt5_order_if_any(conn,pair:str,d:date, *, db_clear: bool = True):
-    row=fetch_core(conn,pair,d)
+def cancel_pending_mt5_order_if_any(conn,pair:str,d:date,session:str, *, db_clear: bool = True):
+    row=fetch_core(conn,pair,d,session)
     if not row or not row.get("mt5_order_id"): return
     oid=int(row["mt5_order_id"])
     os_=mt5.orders_get(ticket=oid)
@@ -539,19 +539,19 @@ def cancel_pending_mt5_order_if_any(conn,pair:str,d:date, *, db_clear: bool = Tr
         with conn.cursor() as cur:
             cur.execute(f"""UPDATE {live_tbl()} SET order_status='CANCELLED',
                             mt5_order_id=NULL, mt5_request_id=NULL, mt5_order_type=NULL, updated_at=NOW()
-                            WHERE pair=%s AND trade_date=%s""",(pair,d)); conn.commit()
+                            WHERE pair=%s AND trade_date=%s AND session=%s""",(pair,d,session)); conn.commit()
 
-def replace_pending_order_with(conn, pair:str, side:str, entry:float, sl:float, tp:float, today:date):
+def replace_pending_order_with(conn, pair:str, side:str, entry:float, sl:float, tp:float, today:date, session:str):
     # cancel (not throttled), then place (throttled inside place_stop_order)
-    cancel_pending_mt5_order_if_any(conn, pair, today, db_clear=False)
+    cancel_pending_mt5_order_if_any(conn, pair, today, session, db_clear=False)
     ok, oid, reqid, otype, lots = place_stop_order(pair, side, entry, sl, tp)
     with conn.cursor() as cur:
         cur.execute(f"""UPDATE {live_tbl()} SET risk_pct=%s,lots=%s,
                         mt5_order_id=%s, mt5_request_id=%s, mt5_order_type=%s,
                         order_status=%s, updated_at=NOW()
-                        WHERE pair=%s AND trade_date=%s""",
+                        WHERE pair=%s AND trade_date=%s AND session=%s""",
                     (RISK_PERCENT, lots, oid, reqid, otype,
-                     ("PLACED" if ok else "REJECTED"), pair, today))
+                     ("PLACED" if ok else "REJECTED"), pair, today, session))
         conn.commit()
     return ok
 
@@ -590,22 +590,22 @@ def infer_result_from_history(order_id:int, symbol:str, tp:Optional[float], sl:O
 def reconcile_all_open_positions(conn):
     with conn.cursor() as cur:
         cur.execute(f"""
-            SELECT pair, trade_date
+            SELECT pair, trade_date, session
             FROM {live_tbl()}
             WHERE status = 'TRIGGERED' AND closed_at IS NULL
         """)
         rows = cur.fetchall()
-    for pair, d in rows:
+    for pair, d, sess in rows:
         try:
-            reconcile_with_mt5(conn, pair, d)
+            reconcile_with_mt5(conn, pair, d, sess)
         except Exception as e:
             L(f"[MT5-RECONCILE-OPEN-ERR] {pair} d={d}: {e}")
 
 
-def reconcile_with_mt5(conn, pair:str, today:date):
+def reconcile_with_mt5(conn, pair:str, today:date, session:str):
     if not (ENABLE_TRADING and MT5_ENABLED and mt5_initialize()):
             return
-    row = fetch_core(conn, pair, today)
+    row = fetch_core(conn, pair, today, session)
     if not row:
         return
     status = (row["status"] or "").upper() if row["status"] else None
@@ -628,11 +628,11 @@ def reconcile_with_mt5(conn, pair:str, today:date):
     if pos and status != "TRIGGERED":
         t = getattr(pos, "time_msc", None) or getattr(pos, "time", None)
         opened_ms = int(t) if (t and int(t)>10_000_000_000) else (int(t)*1000 if t else int(datetime.now(tz=UTC).timestamp()*1000))
-        mark_triggered(conn, pair, today, opened_ms)
+        mark_triggered(conn, pair, today, session, opened_ms)
         try:
             with conn.cursor() as cur:
                 cur.execute(f"""UPDATE {live_tbl()} SET order_status='FILLED', updated_at=NOW()
-                                WHERE pair=%s AND trade_date=%s""", (pair, today)); conn.commit()
+                                WHERE pair=%s AND trade_date=%s AND session=%s""", (pair, today, session)); conn.commit()
         except Exception:
             pass
         return
@@ -641,7 +641,7 @@ def reconcile_with_mt5(conn, pair:str, today:date):
         tp=row.get("tp"); sl=row.get("sl")
         res,closed_ms = infer_result_from_history(int(oid) if oid else 0, pair, tp, sl, lookback_days=7)
         if res in ("WIN","LOSS"):
-            mark_outcome(conn, pair, today, closed_ms or int(datetime.now(tz=UTC).timestamp()*1000), res)
+            mark_outcome(conn, pair, today, session, closed_ms or int(datetime.now(tz=UTC).timestamp()*1000), res)
             return
         return
 
@@ -666,9 +666,9 @@ def reconcile_with_mt5(conn, pair:str, today:date):
             window_is_over = (now_ms >= e_ms) or (last_15m + FIFTEEN_MS >= e_ms)
             if window_is_over:
                 # sécurité: on s'assure qu'aucun pending ne reste côté MT5
-                cancel_pending_mt5_order_if_any(conn, pair, today, db_clear=True)
+                cancel_pending_mt5_order_if_any(conn, pair, today, session, db_clear=True)
                 # on aligne la colonne "status" du modèle
-                mark_outcome(conn, pair, today, e_ms, "CANCELLED")
+                mark_outcome(conn, pair, today, session, e_ms, "CANCELLED")
         except Exception:
             traceback.print_exc()
 
@@ -676,22 +676,24 @@ def reconcile_with_mt5(conn, pair:str, today:date):
 # ---------- Core ----------
 def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     upsert_base_row(conn, pair, today, session, tp_level)
-    row = fetch_core(conn, pair, today)
+    row = fetch_core(conn, pair, today, session)
 
     if is_terminal((row["status"] or "").upper() if row and row["status"] else None):
         return
 
     # --- NEW: if another day still has an open TRIGGERED trade for this pair, cancel today's line
+    #           cancel today's line for this (pair, session)
     with conn.cursor() as cur:
         cur.execute(f"""
             SELECT 1
             FROM {live_tbl()}
             WHERE pair=%s
+              AND session=%s
               AND trade_date <> %s
               AND status = 'TRIGGERED'
               AND closed_at IS NULL
             LIMIT 1
-        """, (pair, today))
+        """, (pair, session, today))
         _has_open_other_day = cur.fetchone() is not None
     if _has_open_other_day:
         with conn.cursor() as cur:
@@ -700,19 +702,19 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                 SET status='CANCELLED',
                     closed_at=NOW(),
                     updated_at=NOW()
-                WHERE pair=%s AND trade_date=%s
-            """, (pair, today))
+                WHERE pair=%s AND trade_date=%s AND session=%s
+            """, (pair, today, session))
             conn.commit()
         return
 
     s_ms, e_ms = session_signal_window(session, today)
 
     if not row["range_1h_at"]:
-        ok = set_range_1h_from_midnight(conn, pair, today)
+        ok = set_range_1h_from_midnight(conn, pair, today, session)
         if not ok:
             L(f"{pair}: waiting 00:00 H1 available")
             return
-        row = fetch_core(conn, pair, today)
+        row = fetch_core(conn, pair, today, session)
         if is_terminal((row["status"] or "").upper() if row and row["status"] else None):
             return
 
@@ -735,8 +737,8 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     def update_base_entry_sl(entry_v: float, sl_v: float):
         with conn.cursor() as cur:
             cur.execute(f"""UPDATE {live_tbl()} SET entry=%s, sl=%s, updated_at=NOW()
-                            WHERE pair=%s AND trade_date=%s""",
-                        (round_price(pair, entry_v), round_price(pair, sl_v), pair, today))
+                            WHERE pair=%s AND trade_date=%s AND session=%s""",
+                        (round_price(pair, entry_v), round_price(pair, sl_v), pair, today, session))
             conn.commit()
 
     # helper: decide if candidate SL should replace current SL (only by comparing to current SL, not entry)
@@ -752,13 +754,13 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     def sync_ready(entry_v: float, sl_new: float):
         entry_r = round_price(pair, entry_v)
         sl_r = round_price(pair, sl_new)
-        cur = fetch_core(conn, pair, today)
+        cur = fetch_core(conn, pair, today, session)
         side_loc = (cur["side"] or "").upper()
         tp_r = round_price(pair, compute_tp(entry_r, sl_r, side_loc, cur["tp_level"]))
-        update_ready_order_values(conn, pair, today, entry_r, sl_r, tp_r)
+        update_ready_order_values(conn, pair, today, session, entry_r, sl_r, tp_r)
 
         if ENABLE_TRADING and MT5_ENABLED and mt5_initialize():
-            cur2 = fetch_core(conn, pair, today)
+            cur2 = fetch_core(conn, pair, today, session)
             oid = cur2.get("mt5_order_id") if cur2 else None
             prev_lots = float(cur2.get("lots") or 0.0)
             new_lots = calc_lots(pair, RISK_PERCENT, float(entry_r), float(sl_r))
@@ -769,7 +771,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                 return
 
             if not oid:
-                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)  # throttled (via place)
+                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today, session)  # throttled (via place)
                 return
 
             si = mt5.symbol_info(pair); step = float(si.volume_step) if si else 0.01
@@ -777,10 +779,10 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
             if same_volume:
                 modify_stop_order(int(oid), entry_r, sl_r, tp_r)  # throttled
             else:
-                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today)  # throttled (via place)
+                replace_pending_order_with(conn, pair, side_loc, float(entry_r), float(sl_r), float(tp_r), today, session)  # throttled (via place)
 
     # state
-    row = fetch_core(conn, pair, today)
+    row = fetch_core(conn, pair, today, session)
     side = (row["side"] or "").upper() if row["side"] else None
     status = (row["status"] or "").upper() if row["status"] else None
     break_at = row["break_at"]
@@ -793,17 +795,17 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
             ts = int(b["ts"]); o, h, l, c = b["open"], b["high"], b["low"], b["close"]
             if c > high_1h:
                 side = "LONG"; entry_base = h; sl_base = l
-                mark_break(conn, pair, today, side, ts, round_price(pair, entry_base))
+                mark_break(conn, pair, today, session, side, ts, round_price(pair, entry_base))
                 update_base_entry_sl(entry_base, sl_base)
                 L(f"{pair}: BREAK LONG @ {iso_utc(ts)} base entry={fmt_price(pair,entry_base)} sl={fmt_price(pair,sl_base)}")
             elif c < low_1h:
                 side = "SHORT"; entry_base = l; sl_base = h
-                mark_break(conn, pair, today, side, ts, round_price(pair, entry_base))
+                mark_break(conn, pair, today, session, side, ts, round_price(pair, entry_base))
                 update_base_entry_sl(entry_base, sl_base)
                 L(f"{pair}: BREAK SHORT @ {iso_utc(ts)} base entry={fmt_price(pair,entry_base)} sl={fmt_price(pair,sl_base)}")
-            bump_last_processed(conn, pair, today, ts)
+            bump_last_processed(conn, pair, today, session, ts)
 
-        row = fetch_core(conn, pair, today)
+        row = fetch_core(conn, pair, today, session)
         side = (row["side"] or "").upper() if row and row["side"] else side
         status = (row["status"] or "").upper() if row and row["status"] else None
         if is_terminal(status): return
@@ -815,10 +817,10 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
     for b in bars:
         ts = int(b["ts"]); o, h, l, c = b["open"], b["high"], b["low"], b["close"]
 
-        row_cur = fetch_core(conn, pair, today)
+        row_cur = fetch_core(conn, pair, today, session)
         st = (row_cur["status"] or "").upper() if row_cur and row_cur["status"] else None
         if is_terminal(st):
-            bump_last_processed(conn, pair, today, ts); continue
+            bump_last_processed(conn, pair, today, session, ts); continue
 
         cur_entry = float(row_cur["entry"]) if row_cur and row_cur["entry"] is not None else entry_base
         cur_sl    = float(row_cur["sl"])    if row_cur and row_cur["sl"]    is not None else sl_base
@@ -827,21 +829,21 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         if st != "TRIGGERED":
             if side == "LONG" and c < low_1h:
                 L(f"{pair}: FLIP → SHORT @ {iso_utc(ts)}")
-                reset_state_on_flip(conn, pair, today)
+                reset_state_on_flip(conn, pair, today, session)
                 side = "SHORT"; entry_base = l; sl_base = h
-                mark_break(conn, pair, today, side, ts, round_price(pair, entry_base))
+                mark_break(conn, pair, today, session, side, ts, round_price(pair, entry_base))
                 update_base_entry_sl(entry_base, sl_base)
-                bump_last_processed(conn, pair, today, ts); continue
+                bump_last_processed(conn, pair, today, session, ts); continue
             if side == "SHORT" and c > high_1h:
                 L(f"{pair}: FLIP → LONG @ {iso_utc(ts)}")
-                reset_state_on_flip(conn, pair, today)
+                reset_state_on_flip(conn, pair, today, session)
                 side = "LONG"; entry_base = h; sl_base = l
-                mark_break(conn, pair, today, side, ts, round_price(pair, entry_base))
+                mark_break(conn, pair, today, session, side, ts, round_price(pair, entry_base))
                 update_base_entry_sl(entry_base, sl_base)
-                bump_last_processed(conn, pair, today, ts); continue
+                bump_last_processed(conn, pair, today, session, ts); continue
 
         if st in ("TRIGGERED","WIN","LOSS","CANCELLED"):
-            bump_last_processed(conn, pair, today, ts); continue
+            bump_last_processed(conn, pair, today, session, ts); continue
 
         # --- Phase A: NOT READY (tracking)
         if st is None or st == "":
@@ -878,7 +880,7 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
 
                 tp_r = round_price(pair, compute_tp(entry_frozen, sl_start, side, row_cur["tp_level"]))
 
-                mark_pullback(conn, pair, today, ts, float(sl_start),
+                mark_pullback(conn, pair, today, session, ts, float(sl_start),
                               float(entry_frozen), float(sl_start), float(tp_r))
 
                 if ENABLE_TRADING and MT5_ENABLED and mt5_initialize():
@@ -888,10 +890,10 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                     with conn.cursor() as cur:
                         cur.execute(f"""UPDATE {live_tbl()} SET risk_pct=%s,lots=%s,mt5_order_id=%s,mt5_request_id=%s,
                                         mt5_order_type=%s,order_status=%s,updated_at=NOW()
-                                        WHERE pair=%s AND trade_date=%s""",
+                                        WHERE pair=%s AND trade_date=%s AND session=%s""",
                                     (RISK_PERCENT, lots, oid, reqid, otype,
-                                     ("PLACED" if ok else "REJECTED"), pair, today)); conn.commit()
-                bump_last_processed(conn, pair, today, ts); continue
+                                     ("PLACED" if ok else "REJECTED"), pair, today, session)); conn.commit()
+                bump_last_processed(conn, pair, today, session, ts); continue
 
 
         # --- Phase B: READY — trail SL only if bar extends vs current SL
@@ -913,10 +915,10 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
                 except Exception:
                     pos = None
                 if pos and st != "TRIGGERED":
-                    mark_triggered(conn, pair, today, ts)
+                    mark_triggered(conn, pair, today, session, ts)
 
         # post-check outcome
-        row_now = fetch_core(conn, pair, today)
+        row_now = fetch_core(conn, pair, today, session)
         st_now = (row_now["status"] or "").upper() if row_now and row_now["status"] else None
         if ENABLE_TRADING and MT5_ENABLED and st_now == "TRIGGERED":
             oid = row_now.get("mt5_order_id"); tp_val = row_now.get("tp"); sl_val = row_now.get("sl")
@@ -924,13 +926,13 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
             if not poslist:
                 res, closed_ms = infer_result_from_history(int(oid) if oid else 0, pair, tp_val, sl_val, lookback_days=7)
                 if res in ("WIN","LOSS"):
-                    mark_outcome(conn, pair, today, closed_ms or ts, res)
+                    mark_outcome(conn, pair, today, session, closed_ms or ts, res)
                     return
 
-        bump_last_processed(conn, pair, today, ts)
+        bump_last_processed(conn, pair, today, session, ts)
 
     # End of window: cancel if nothing triggered
-    row_end = fetch_core(conn, pair, today)
+    row_end = fetch_core(conn, pair, today, session)
     st_end = (row_end["status"] or "").upper() if row_end and row_end["status"] else None
 
     # fenêtre considérée close quand la dernière 15m dispo + 15 min >= e_ms
@@ -938,8 +940,8 @@ def process_pair(conn, session:str, pair:str, tp_level:str, today:date):
         # cas 1 : jamais déclenché -> on nettoie et on marque CANCELLED
         if st_end in (None, "", "READY"):
             if ENABLE_TRADING and MT5_ENABLED and mt5_initialize():
-                cancel_pending_mt5_order_if_any(conn, pair, today)
-            mark_outcome(conn, pair, today, e_ms, "CANCELLED")
+                cancel_pending_mt5_order_if_any(conn, pair, today, session)
+            mark_outcome(conn, pair, today, session, e_ms, "CANCELLED")
         # cas 2 : TRIGGERED -> NE RIEN FAIRE (on laisse MT5 décider WIN/LOSS)
         # cas 3 : terminal (WIN/LOSS/CANCELLED) -> NE RIEN FAIRE
         return
@@ -972,7 +974,7 @@ def main():
                         for delta in range(0, 3):  # today, today-1, today-2
                             d = today - timedelta(days=delta)
                             try:
-                                reconcile_with_mt5(conn, pair, d)
+                                reconcile_with_mt5(conn, pair, d, sess)
                             except Exception as e:
                                 L(f"[MT5-RECONCILE-ERR] {pair} d={d}: {e}")
                                 traceback.print_exc()
