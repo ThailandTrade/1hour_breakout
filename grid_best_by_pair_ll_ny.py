@@ -223,59 +223,54 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
 # ---------------- After-entry evaluation (CORE LOGIC — étendu à RR5) ----------------
 def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
     """
-    Enregistre les timestamps de RR1..RR5/SL; stop au premier SL ou RR5.
+    Enregistre les timestamps de RR1..RR3/SL; stop au premier SL ou RR3.
     """
     eps = pip_eps_for(pair)
     entry, sl = tr.entry, tr.sl
     r = abs(entry - sl)
     if r <= 0:
-        targets = {"RR1": entry, "RR2": entry, "RR3": entry, "RR4": entry, "RR5": entry}
-        results = {k: "SL" for k in ["RR1","RR2","RR3","RR4","RR5"]}
-        return targets, results, {"SL": None, "RR1": None, "RR2": None, "RR3": None, "RR4": None, "RR5": None}, None
+        targets = {"RR1": entry, "RR2": entry, "RR3": entry}
+        results = {k: "SL" for k in ["RR1", "RR2", "RR3"]}
+        return targets, results, {"SL": None, "RR1": None, "RR2": None, "RR3": None}, None
 
     if tr.side == "LONG":
-        t1, t2, t3, t4, t5 = (entry + n*r for n in (1.0, 2.0, 3.0, 4.0, 5.0))
+        t1, t2, t3 = (entry + n * r for n in (1.0, 2.0, 3.0))
     else:
-        t1, t2, t3, t4, t5 = (entry - n*r for n in (1.0, 2.0, 3.0, 4.0, 5.0))
+        t1, t2, t3 = (entry - n * r for n in (1.0, 2.0, 3.0))
 
-    targets = {"RR1": t1, "RR2": t2, "RR3": t3, "RR4": t4, "RR5": t5}
-    hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None, "RR2": None, "RR3": None, "RR4": None, "RR5": None}
+    targets = {"RR1": t1, "RR2": t2, "RR3": t3}
+    hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None, "RR2": None, "RR3": None}
 
     future = read_15m_from(conn, pair, tr.entry_ts)
     for b in future:
-        ts,h,l = b["ts"], b["high"], b["low"]
+        ts, h, l = b["ts"], b["high"], b["low"]
         if tr.side == "LONG":
             sl_hit  = (l <= sl + eps)
             rr1_hit = (h >= t1 - eps)
             rr2_hit = (h >= t2 - eps)
             rr3_hit = (h >= t3 - eps)
-            rr4_hit = (h >= t4 - eps)
-            rr5_hit = (h >= t5 - eps)
         else:
             sl_hit  = (h >= sl - eps)
             rr1_hit = (l <= t1 + eps)
             rr2_hit = (l <= t2 + eps)
             rr3_hit = (l <= t3 + eps)
-            rr4_hit = (l <= t4 + eps)
-            rr5_hit = (l <= t5 + eps)
 
         if hit_time["SL"]  is None and sl_hit:  hit_time["SL"]  = ts
         if hit_time["RR1"] is None and rr1_hit: hit_time["RR1"] = ts
         if hit_time["RR2"] is None and rr2_hit: hit_time["RR2"] = ts
         if hit_time["RR3"] is None and rr3_hit: hit_time["RR3"] = ts
-        if hit_time["RR4"] is None and rr4_hit: hit_time["RR4"] = ts
-        if hit_time["RR5"] is None and rr5_hit: hit_time["RR5"] = ts
 
-        if (hit_time["SL"] is not None) or (hit_time["RR5"] is not None):
+        # On s'arrête dès qu'on a SL ou RR3
+        if (hit_time["SL"] is not None) or (hit_time["RR3"] is not None):
             break
 
     results: Dict[str, str] = {}
     sl_time = hit_time["SL"]
-    for key in ["RR1","RR2","RR3","RR4","RR5"]:
+    for key in ["RR1", "RR2", "RR3"]:
         ttime = hit_time[key]
         results[key] = "TP" if (ttime is not None and (sl_time is None or ttime < sl_time)) else "SL"
 
-    closed_ts = sl_time if sl_time is not None else hit_time["RR5"]
+    closed_ts = sl_time if sl_time is not None else hit_time["RR3"]
     return targets, results, hit_time, closed_ts
 
 # ---------------- Partials (w1..w5) -> R-multiple ----------------
@@ -380,13 +375,11 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
 
 # ---------------- Grille des poids (w1..w5) ----------------
 def weight_grid(step: float = 0.1):
-    # Full TP only: (1,0,0,0,0) .. (0,0,0,0,1)
+    # Full TP only: (1,0,0,0,0) .. (0,0,1,0,0)
     options = [
         (1.0, 0.0, 0.0, 0.0, 0.0),  # full TP1
         (0.0, 1.0, 0.0, 0.0, 0.0),  # full TP2
         (0.0, 0.0, 1.0, 0.0, 0.0),  # full TP3
-        (0.0, 0.0, 0.0, 1.0, 0.0),  # full TP4
-        (0.0, 0.0, 0.0, 0.0, 1.0),  # full TP5
     ]
     for w1, w2, w3, w4, w5 in options:
         yield (w1, w2, w3, w4, w5)
@@ -406,9 +399,17 @@ def print_session_csv(rows: List[Dict[str, Any]]):
     # Filtre identique à print_simple_tp_table
     selected: List[Dict[str, Any]] = []
     for r in rows:
-        if r["trades"] <= 0:
+        # 1) Activité
+        if r["trades"] < 30:
             continue
-        if r["pf"] < 1.5 or r["mdd_r"] >= 8.0:
+        # 2) Rentabilité
+        if r["exp"] < 0.20:
+            continue
+        # 3) PF minimum
+        if r["pf"] < 1.5:
+            continue
+        # 4) Drawdown max
+        if r["mdd_r"] > 8.0:
             continue
         selected.append(r)
 
@@ -633,9 +634,17 @@ def print_simple_tp_table(rows: List[Dict[str, Any]]):
 
     selected: List[Dict[str, Any]] = []
     for r in rows:
-        if r["trades"] <= 0:
+        # 1) Activité
+        if r["trades"] < 30:
             continue
-        if r["pf"] < 1.5 or r["mdd_r"] >= 8.0:
+        # 2) Rentabilité
+        if r["exp"] < 0.20:
+            continue
+        # 3) PF minimum
+        if r["pf"] < 1.5:
+            continue
+        # 4) Drawdown max
+        if r["mdd_r"] > 8.0:
             continue
 
         # Déterminer le TP cible en fonction du poids
