@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Multi-Pairs — Best (Session × w1,w2,w3) per Pair — Expectancy Recap (1 ligne par paire)
++ Breakdown Pair × Jour de la semaine × TP (TP unique) au format CSV :
+
+SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI
+TOKYO,INDEX,GBPCAD,TP3,Y,N,N,N,Y
 
 RÈGLE (mise à jour) :
 - On détermine, pour chaque paire, le meilleur moment (session) pour LANCER un trade.
@@ -14,26 +18,30 @@ Entrées & cibles (inchangé, sauf SL de l’entrée cf. plus bas) :
 - WIN/LOSS: WIN si TP1 < SL, sinon LOSS (indépendant des poids).
 - R-multiple: application événementielle des partiels (w1,w2,w3), w1+w2+w3=1.
 - Sessions: TOKYO / LONDON / NY.
-- Sortie: tableau final trié par Expectancy (R) — 1 ligne = la meilleure combinaison par paire.
+- Sortie 1: tableau final trié par Expectancy (R) — 1 ligne = la meilleure combinaison par paire.
+- Sortie 2: breakdown Pair × Jour de la semaine × TP (TP unique) au format CSV, en ne gardant que les lignes
+           où au moins un jour a une expectancy > 0.1.
 
 I/O:
-- Lit les paires depuis --pairs-file (default: pairs.txt). Format simple: une paire par ligne,
+- Lit les paires depuis --pairs-file (default: pairs_5ers.txt). Format simple: une paire par ligne,
   ou CSV avec une colonne "pair"/"pairs". Dédoublonnage automatique.
 - Pas de sizing ni de frais: optimisation pure en R.
 
 Usage:
-  python grid_best_by_pair.py --pairs-file pairs.txt --start-date 2025-01-01 --end-date 2025-12-31
+  python grid_best_by_pair.py --pairs-file pairs_5ers.txt --start-date 2025-01-01 --end-date 2025-12-31
 """
 
 import os, sys, argparse, csv
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict, Any
 from datetime import datetime, timedelta, timezone, date
+from collections import defaultdict
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import extensions as pg_ext
 
 UTC = timezone.utc
+WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
 # ---------------- ENV / DB ----------------
 load_dotenv()
@@ -71,27 +79,27 @@ def day_ms_bounds(d: date) -> Tuple[int, int]:
 # ---- Sessions (fenêtres UTC) ----
 def tokyo_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=1)).timestamp()*1000)                # 01:00
-    end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)   # 05:45
+    start = int((base + timedelta(hours=1)).timestamp()*1000)                 # 01:00
+    end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)    # 05:45
     return start, end
 
 def london_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=8)).timestamp()*1000)                 # 08:00
+    start = int((base + timedelta(hours=8)).timestamp()*1001000) if False else int((base + timedelta(hours=8)).timestamp()*1000)  # safeguard
     end   = int((base + timedelta(hours=14, minutes=45)).timestamp()*1000)   # 14:45
     return start, end
 
 def ny_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 12:00
-    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 16:45
+    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 13:00
+    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 17:45
     return start, end
 
 def window_for_session(session: str, d: date) -> Tuple[int, int]:
     s = (session or "").strip().upper()
     if s == "TOKYO":  return tokyo_signal_window(d)
     if s == "LONDON": return london_signal_window(d)
-    if s in ("NY","NEWYORK","NEW_YORK"): return ny_signal_window(d)
+    if s in ("NY", "NEWYORK", "NEW_YORK"): return ny_signal_window(d)
     return tokyo_signal_window(d)
 
 # ---------------- Helpers ----------------
@@ -109,6 +117,35 @@ def pip_size_for(pair: str) -> float:
     if pair.upper().startswith("XAU"):
         return 0.01
     return 0.01 if pair.upper().endswith("JPY") else 0.0001
+
+def infer_type(pair: str) -> str:
+    """
+    Heuristique simple pour TYPE: FOREX / METAL / INDEX / CRYPTO
+    (Tu pourras ajuster la liste en fonction de tes instruments exacts.)
+    """
+    up = pair.upper()
+
+    # Metals
+    if up.startswith("XAU") or up.startswith("XAG") or up.startswith("XPT") or up.startswith("XPD"):
+        return "METAL"
+
+    # Index (liste à compléter si besoin)
+    index_symbols = {
+        "NAS100", "US30", "US500", "SPX500", "GER40", "UK100", "FRA40",
+        "JPN225", "JP225", "HK50"
+    }
+    if up in index_symbols:
+        return "INDEX"
+
+    # Crypto (liste à compléter si besoin)
+    crypto_symbols = {
+        "BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "ADAUSD", "SOLUSD"
+    }
+    if up in crypto_symbols:
+        return "CRYPTO"
+
+    # Par défaut
+    return "FOREX"
 
 # ---------------- DB Readers ----------------
 def read_first_1h(conn, pair: str, d: date) -> Optional[Dict]:
@@ -335,6 +372,7 @@ def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
 @dataclass
 class BareTrade:
     hits: Dict[str, Optional[int]]  # {"SL": ts|None, "RR1": ts|None, "RR2": ts|None, "RR3": ts|None}
+    entry_ts: int                   # ts OPEN UTC de la bougie de trigger
 
 def collect_trades_for_session(conn, pair: str, start: date, end: date, session: str) -> List[BareTrade]:
     """
@@ -343,7 +381,7 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
     """
     trades: List[BareTrade] = []
 
-    # --- NEW: cross-day blocking while last trade is open (Tokyo-only usage) ---
+    # cross-day blocking
     block_until_ts: Optional[int] = None  # ts de clôture (SL ou RR3) du dernier trade
 
     for d in daterange(start, end):
@@ -371,7 +409,7 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
 
         # 4) Enregistre les hits pour calculer R/TP% ET récupérer le closed_ts
         _, _, hits, closed_ts = evaluate_trade_after_entry(conn, pair, tr)
-        trades.append(BareTrade(hits=hits))
+        trades.append(BareTrade(hits=hits, entry_ts=tr.entry_ts))
 
         # 5) Cross-day blocking: BLOQUE jusqu'à SL ou RR3
         block_until_ts = closed_ts if closed_ts is not None else (2**62)
@@ -429,6 +467,68 @@ def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float) 
     p3 = tp3_cnt / total
 
     return {"trades": total, "winrate": winrate, "avg_win": avg_win, "avg_loss": avg_loss, "exp": expectancy, "p1": p1, "p2": p2, "p3": p3}
+
+# ---------------- Breakdown Pair / Jour / TP (TP unique) ----------------
+def build_breakdown_rows_for_pair(pair: str, session: str, trades: List[BareTrade]) -> List[Dict[str, Any]]:
+    """
+    Breakdown par paire / jour de la semaine / TP :
+    - On considère un TP UNIQUE (TP1, TP2 ou TP3).
+    - R-multiple simple : +k R si TPk avant SL, sinon -1 R.
+      (k = 1 pour TP1, 2 pour TP2, 3 pour TP3)
+    """
+    buckets = defaultdict(lambda: {"trades": 0, "wins": 0, "sum_r": 0.0})
+
+    for bt in trades:
+        hits = bt.hits
+        # jour d'entrée du trade (UTC)
+        dt = datetime.fromtimestamp(bt.entry_ts / 1000, tz=UTC)
+        dow_idx = dt.weekday()          # 0=MON, 6=SUN
+        dow_name = WEEKDAYS[dow_idx]
+
+        t_sl = hits.get("SL")
+
+        # On évalue le trade comme s'il utilisait un TP unique (TP1 / TP2 / TP3)
+        for tp_key, k, tp_label in [("RR1", 1, "TP1"),
+                                    ("RR2", 2, "TP2"),
+                                    ("RR3", 3, "TP3")]:
+            bucket_key = (dow_name, tp_label)
+            buckets[bucket_key]["trades"] += 1
+
+            t_tp = hits.get(tp_key)
+            if (t_tp is not None) and (t_sl is None or t_tp < t_sl):
+                r = float(k)  # TPk atteint avant SL
+                buckets[bucket_key]["wins"] += 1
+            else:
+                r = -1.0      # SL avant (ou TP jamais atteint)
+
+            buckets[bucket_key]["sum_r"] += r
+
+    rows: List[Dict[str, Any]] = []
+
+    # Tri par jour puis TP
+    def sort_key(item):
+        (dow_name, tp_label) = item[0]
+        return (WEEKDAYS.index(dow_name), tp_label)
+
+    for (dow_name, tp_label), agg in sorted(buckets.items(), key=sort_key):
+        total = agg["trades"]
+        if total == 0:
+            continue
+        wins = agg["wins"]
+        winrate = wins / total
+        avg_r = agg["sum_r"] / total  # expectancy R moyen avec ce TP unique
+
+        rows.append({
+            "pair": pair,
+            "session": session,
+            "dow": dow_name,
+            "tp": tp_label,
+            "trades": total,
+            "winrate": winrate,
+            "expectancy": avg_r,
+        })
+
+    return rows
 
 # ---------------- Chargement des paires ----------------
 def load_pairs_from_file(path: str) -> List[str]:
@@ -514,6 +614,90 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
             ]))
         print("==========================================================")
 
+# ---------------- Impression breakdown CSV Pair / Jour / TP ----------------
+def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4):
+    """
+    Affiche au format :
+
+    SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI
+
+    Règle:
+    - Pour chaque (session, pair, jour), on choisit le TP (TP1/TP2/TP3) avec la meilleure expectancy.
+    - On met Y sur ce TP si son expectancy > exp_threshold, sinon N.
+    - Un seul TP peut être Y par jour et par paire/session.
+    - On ne garde que les lignes (session, pair, TP) avec au moins un Y.
+    """
+    if not rows:
+        print("\nAucun trade pour le breakdown pair/jour/TP.")
+        return
+
+    # 1) On regroupe par (session, pair, day, tp) -> expectancy
+    # structure : by_sp_day[(session, pair)][day][tp] = expectancy
+    by_sp_day: Dict[Tuple[str, str], Dict[str, Dict[str, Optional[float]]]] = {}
+
+    valid_days = ["MON", "TUE", "WED", "THU", "FRI"]
+
+    for r in rows:
+        session = r["session"]
+        pair    = r["pair"]
+        dow     = r["dow"]
+        tp      = r["tp"]   # "TP1" / "TP2" / "TP3"
+        exp     = r["expectancy"]
+
+        if dow not in valid_days:
+            continue  # on ignore le weekend dans ce CSV
+
+        key = (session, pair)
+        if key not in by_sp_day:
+            by_sp_day[key] = {d: {} for d in valid_days}
+        by_sp_day[key][dow][tp] = exp
+
+    # 2) Pour chaque (session, pair, day), déterminer le TP avec la meilleure expectancy
+    # best_tp_per_spd[(session, pair, day)] = (tp_best, exp_best) ou (None, None)
+    best_tp_per_spd: Dict[Tuple[str, str, str], Tuple[Optional[str], Optional[float]]] = {}
+
+    for (session, pair), day_map in by_sp_day.items():
+        for d in valid_days:
+            tps = day_map.get(d, {})
+            best_tp = None
+            best_exp = None
+            for tp in ["TP1", "TP2", "TP3"]:
+                e = tps.get(tp)
+                if e is None:
+                    continue
+                if (best_exp is None) or (e > best_exp):
+                    best_exp = e
+                    best_tp = tp
+            best_tp_per_spd[(session, pair, d)] = (best_tp, best_exp)
+
+    # 3) Construire la structure finale par (session, pair, tp) -> flags par jour
+    # final_flags[(session, pair, tp)] = {day: "Y"/"N"}
+    final_flags: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+
+    for (session, pair, d), (tp_best, exp_best) in best_tp_per_spd.items():
+        for tp in ["TP1", "TP2", "TP3"]:
+            key = (session, pair, tp)
+            if key not in final_flags:
+                final_flags[key] = {day: "N" for day in valid_days}
+
+            # Si ce TP est le meilleur du jour et dépasse le seuil -> Y, sinon N (on laisse comme N)
+            if tp_best == tp and exp_best is not None and exp_best > exp_threshold:
+                final_flags[key][d] = "Y"
+
+    # 4) Impression CSV : on ne garde que les lignes avec au moins un Y
+    print("\nSESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
+
+    # tri par SESSION, PAIR, TP
+    for (session, pair, tp), day_flags in sorted(final_flags.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        flags_list = [day_flags[d] for d in valid_days]
+        if not any(f == "Y" for f in flags_list):
+            continue  # on skip les lignes full N
+
+        pair_type = infer_type(pair)
+        line = f"{session},{pair_type},{pair},{tp}," + ",".join(flags_list)
+        print(line)
+
+
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -521,6 +705,7 @@ def main():
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date",   default="2025-12-31")
     ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Pas de grille (fixé à 0.1)")
+    ap.add_argument("--exp-threshold", type=float, default=0.15, help="Seuil d'expectancy pour marquer Y et filtrer les lignes")
     args = ap.parse_args()
 
     pairs = load_pairs_from_file(args.pairs_file)
@@ -531,10 +716,11 @@ def main():
     d0 = parse_date(args.start_date)
     d1 = parse_date(args.end_date)
 
-    # --- TOKYO ONLY ---
+    # --- TOKYO ONLY (ajoute LONDON/NY si besoin) ---
     sessions = ["TOKYO"]
 
     best_rows: List[Dict[str, Any]] = []
+    breakdown_rows: List[Dict[str, Any]] = []
 
     with get_pg_conn() as c:
         for pair in pairs:
@@ -542,7 +728,7 @@ def main():
             if not pair:
                 continue
 
-            # 1) Collecte des trades par session (TOKYO only)
+            # 1) Collecte des trades par session
             session_trades: Dict[str, List[BareTrade]] = {}
             for sess in sessions:
                 print(f"[{pair}] Collecte trades — {sess} ...")
@@ -576,8 +762,18 @@ def main():
                     "p1": 0.0, "p2": 0.0, "p3": 0.0
                 })
 
+            # 4) Breakdown par paire / jour de la semaine / TP (TP unique)
+            for sess in sessions:
+                trades = session_trades[sess]
+                breakdown_rows.extend(
+                    build_breakdown_rows_for_pair(pair, sess, trades)
+                )
+
     # 4) Affichage final (1 ligne par paire)
     print_final_best_table(best_rows)
+
+    # 5) Affichage breakdown pair / jour / TP au format CSV
+    print_breakdown_table(breakdown_rows, exp_threshold=args.exp_threshold)
 
 if __name__ == "__main__":
     main()

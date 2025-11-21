@@ -41,7 +41,7 @@ USE_EQUITY_FOR_RISK=os.getenv("USE_EQUITY_FOR_RISK","true").lower() in ("1","tru
 COMMENT_TAG=os.getenv("COMMENT_TAG","LIVE_BPULL")
 ALLOWED_DEV_POINTS=int(os.getenv("ALLOWED_DEVIATION_POINTS","20"))
 BROKER_MIN_DIST_BUF_PTS=int(os.getenv("BROKER_MIN_DISTANCE_BUFFER_POINTS","0"))
-MAX_LEVERAGE=float(os.getenv("MAX_LEVERAGE","10"))
+MAX_LEVERAGE=float(os.getenv("MAX_LEVERAGE","100"))
 MIN_READY_PIPS=float(os.getenv("MIN_READY_PIPS","0"))
 FEE_PER_LOT=float(os.getenv("FEE_PER_LOT","2.5"))
 
@@ -109,7 +109,7 @@ def session_signal_window(session:str, d:date)->Tuple[int,int]:
 
 # ---------- Sessions file ----------
 def _yes(x:str)->bool: return (x or "").strip().upper().startswith("Y")
-def load_session_file(path="session_pairs_5ers.txt") -> List[Tuple[str, str, str, Dict[int, bool]]]:
+def load_session_file(path="session_pairs_test.txt") -> List[Tuple[str, str, str, Dict[int, bool]]]:
     out = []
     if not os.path.exists(path):
         L(f"[ERR] session file '{path}' not found"); return out
