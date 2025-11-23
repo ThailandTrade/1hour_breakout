@@ -1,8 +1,0 @@
-Tokyo,USDJPY
-Tokyo,AUDUSD
-Tokyo,NZDUSD
-Tokyo,EURJPY
-Tokyo,EURAUD
-Tokyo,GBPAUD
-Tokyo,EURNZD
-Tokyo,GBPNZD
