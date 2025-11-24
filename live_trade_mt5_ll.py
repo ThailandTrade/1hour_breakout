@@ -109,7 +109,7 @@ def session_signal_window(session:str, d:date)->Tuple[int,int]:
 
 # ---------- Sessions file ----------
 def _yes(x:str)->bool: return (x or "").strip().upper().startswith("Y")
-def load_session_file(path="session_pairs_test.txt") -> List[Tuple[str, str, str, Dict[int, bool]]]:
+def load_session_file(path="session_pairs_5ers.txt") -> List[Tuple[str, str, str, Dict[int, bool]]]:
     out = []
     if not os.path.exists(path):
         L(f"[ERR] session file '{path}' not found"); return out
@@ -124,7 +124,8 @@ def load_session_file(path="session_pairs_test.txt") -> List[Tuple[str, str, str
             # compat: alias de session
             if sess in ("NEWYORK", "NEW_YORK"): sess = "NY"
             if sess not in ("TOKYO", "LONDON", "NY"): continue
-            if tp not in ("TP1", "TP2", "TP3"): continue
+            # ---- MODIFIED: accepter TP1..TP5 ----
+            if tp not in ("TP1", "TP2", "TP3", "TP4", "TP5"): continue
 
             allowed = {
                 0: _yes(rec.get("MON")), 1: _yes(rec.get("TUE")),
@@ -317,7 +318,10 @@ def read_15m_in(conn,pair:str,start_ms:int,end_ms:int)->List[Dict[str,Any]]:
 
 # ---------- TP ----------
 def compute_tp(entry:float, sl:float, side:str, tp_level:str)->float:
-    k = 1 if tp_level.upper()=="TP1" else 2 if tp_level.upper()=="TP2" else 3
+    # ---- MODIFIED: gestion TP1..TP5 ----
+    lvl = (tp_level or "TP3").upper()
+    k_map = {"TP1": 1, "TP2": 2, "TP3": 3, "TP4": 4, "TP5": 5}
+    k = k_map.get(lvl, 3)
     r = abs(entry - sl)
     return round(entry + k*r, 10) if side.upper()=="LONG" else round(entry - k*r, 10)
 
