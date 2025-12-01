@@ -90,7 +90,7 @@ def london_signal_window(d: date) -> Tuple[int, int]:
     """
     Fenêtre de signal LONDON définie en heure locale Londres (Europe/London),
     avec gestion automatique été/hiver.
-    Exemple : 08:00–14:45 heure de Londres.
+    Exemple : 08:00–12:45 heure de Londres.
     """
     # Date + heure en heure locale Londres
     local_start = datetime(d.year, d.month, d.day, 8, 0, tzinfo=LONDON_TZ)
@@ -119,18 +119,23 @@ def window_for_session(session: str, d: date) -> Tuple[int, int]:
 # ---------------- Helpers ----------------
 def sanitize_pair(pair: str) -> str:
     import re
-    return re.sub(r"[^a-z0-9]", "", pair.lower())
+    # ALIGNÉ AVEC L'INGESTOR : "USDJPY.c" -> "usdjpy_c"
+    return re.sub(r"[^a-z0-9]+", "_", pair.lower()).strip("_")
 
 def table_name(pair: str, tf: str) -> str:
     return f"candles_mt5_{sanitize_pair(pair)}_{tf.lower()}"
 
 def pip_eps_for(pair: str) -> float:
-    return 0.001 if pair.upper().endswith("JPY") else 0.00001
+    # On ignore le suffixe après un éventuel '.' pour bien détecter les JPY
+    core = pair.upper().split('.')[0]
+    return 0.001 if core.endswith("JPY") else 0.00001
 
 def pip_size_for(pair: str) -> float:
-    if pair.upper().startswith("XAU"):
+    # Même logique : on se base sur le "core" sans suffixe
+    core = pair.upper().split('.')[0]
+    if core.startswith("XAU"):
         return 0.01
-    return 0.01 if pair.upper().endswith("JPY") else 0.0001
+    return 0.01 if core.endswith("JPY") else 0.0001
 
 def infer_type(pair: str) -> str:
     """
@@ -733,7 +738,6 @@ def main():
         print("Aucune paire trouvée.")
         sys.exit(0)
 
-    d0 = parse_date(args.start_date)
     d1 = parse_date(args.end_date)
 
     # --- TOKYO ONLY (ajoute LONDON/NY si besoin) ---
