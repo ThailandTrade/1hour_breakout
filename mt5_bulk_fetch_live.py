@@ -117,7 +117,7 @@ def parse_pairs(path: str) -> List[str]:
         for r in reader:
             p = r.get("pair") or r.get("PAIR") or r.get("Pair")
             if p:
-                pairs.append(p.strip().upper())
+                pairs.append(p.strip())
     return pairs
 
 def parse_pairs_cli(s: str) -> List[str]:
@@ -127,7 +127,7 @@ def parse_pairs_cli(s: str) -> List[str]:
       --pairs "EURUSD GBPUSD USDJPY"
       --pairs "EURUSD,GBPUSD,USDJPY"
     """
-    toks = [t.strip().upper() for t in re.split(r"[,\s]+", s.strip()) if t.strip()]
+    toks = [t.strip() for t in re.split(r"[,\s]+", s.strip()) if t.strip()]
     # Basic sanity filter: 6+ letters (handles metals too, e.g., XAUUSD)
     return [t for t in toks if len(t) >= 6]
 

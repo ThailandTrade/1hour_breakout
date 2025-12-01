@@ -29,6 +29,8 @@ from datetime import datetime, timedelta, timezone, date
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import extensions as pg_ext
+from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 
 # ---------- TOGGLES ----------
 SHOW_TRADES       = True    # Afficher la table des trades clos
@@ -45,6 +47,7 @@ FEE_PER_LOT   = 2.5
 # -----------------------------
 
 UTC = timezone.utc
+LONDON_TZ = ZoneInfo("Europe/London")
 
 # ---------- ENV / DB ----------
 load_dotenv()
@@ -90,12 +93,22 @@ def tokyo_signal_window(d: date) -> Tuple[int, int]:
     fin   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)   # 05:45
     return debut, fin
 
-# *** ALIGNÉ AVEC LE SCRIPT DE RÉFÉRENCE ***
 def london_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    debut = int((base + timedelta(hours=8)).timestamp()*1000)                # 08:00
-    fin   = int((base + timedelta(hours=12, minutes=45)).timestamp()*1000)   # 12:45
-    return debut, fin
+    """
+    Fenêtre de signal LONDON définie en heure locale Londres (Europe/London),
+    avec gestion automatique été/hiver.
+    Exemple : 08:00–12:45 heure de Londres.
+    """
+    # 08:00–12:45 en Europe/London
+    local_start = datetime(d.year, d.month, d.day, 8, 0, tzinfo=LONDON_TZ)
+    local_end   = datetime(d.year, d.month, d.day, 12, 45, tzinfo=LONDON_TZ)
+
+    # Conversion en UTC
+    start_utc = local_start.astimezone(UTC)
+    end_utc   = local_end.astimezone(UTC)
+
+    return int(start_utc.timestamp() * 1000), int(end_utc.timestamp() * 1000)
+
 
 def ny_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)

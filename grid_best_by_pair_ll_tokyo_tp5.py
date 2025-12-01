@@ -39,9 +39,12 @@ from collections import defaultdict
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import extensions as pg_ext
+from datetime import datetime, timedelta, timezone, date
+from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
 WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+LONDON_TZ = ZoneInfo("Europe/London")
 
 # ---------------- ENV / DB ----------------
 load_dotenv()
@@ -84,10 +87,21 @@ def tokyo_signal_window(d: date) -> Tuple[int, int]:
     return start, end
 
 def london_signal_window(d: date) -> Tuple[int, int]:
-    base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=8)).timestamp()*1001000) if False else int((base + timedelta(hours=8)).timestamp()*1000)  # safeguard
-    end   = int((base + timedelta(hours=14, minutes=45)).timestamp()*1000)   # 14:45
-    return start, end
+    """
+    Fenêtre de signal LONDON définie en heure locale Londres (Europe/London),
+    avec gestion automatique été/hiver.
+    Exemple : 08:00–14:45 heure de Londres.
+    """
+    # Date + heure en heure locale Londres
+    local_start = datetime(d.year, d.month, d.day, 8, 0, tzinfo=LONDON_TZ)
+    local_end   = datetime(d.year, d.month, d.day, 12, 45, tzinfo=LONDON_TZ)
+
+    # Conversion en UTC (avec le bon offset selon été/hiver)
+    start_utc = local_start.astimezone(UTC)
+    end_utc   = local_end.astimezone(UTC)
+
+    return int(start_utc.timestamp() * 1000), int(end_utc.timestamp() * 1000)
+
 
 def ny_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
@@ -767,6 +781,12 @@ def main():
     ap.add_argument("--end-date",   default="2025-12-31")
     ap.add_argument("--step", type=float, default=0.1, choices=[0.1], help="Pas de grille (fixé à 0.1)")
     ap.add_argument("--exp-threshold", type=float, default=0.15, help="Seuil d'expectancy pour marquer Y et filtrer les lignes")
+    ap.add_argument(
+        "--session",
+        default="TOKYO",
+        choices=["TOKYO", "LONDON", "NY"],
+        help="Session à tester (TOKYO, LONDON ou NY). Défaut: TOKYO."
+    )
     args = ap.parse_args()
 
     pairs = load_pairs_from_file(args.pairs_file)
@@ -778,7 +798,7 @@ def main():
     d1 = parse_date(args.end_date)
 
     # --- TOKYO ONLY (ajoute LONDON/NY si besoin) ---
-    sessions = ["TOKYO"]
+    sessions = [args.session.upper()]
 
     best_rows: List[Dict[str, Any]] = []
     breakdown_rows: List[Dict[str, Any]] = []
