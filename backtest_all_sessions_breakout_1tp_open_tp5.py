@@ -130,20 +130,20 @@ def window_for_session(session: str, d: date) -> Tuple[int, int]:
 # ---------- Helpers paires / prix ----------
 def sanitize_pair(pair: str) -> str:
     import re
-    return re.sub(r"[^a-z0-9]", "", pair.lower())
+    return re.sub(r"[^a-z0-9]+", "_", pair.lower()).strip("_")
 
 def table_name(pair: str, tf: str) -> str:
     return f"candles_mt5_{sanitize_pair(pair)}_{tf.lower()}"
 
 def pip_eps_for(pair: str) -> float:
-    return 0.001 if pair.upper().endswith("JPY") else 0.00001
+    core = pair.upper().split(".")[0]
+    return 0.001 if core.endswith("JPY") else 0.00001
 
 def pip_size_for(pair: str) -> float:
-    # XAU: 0.01 ; JPY: 0.01 ; sinon 0.0001
-    p = pair.upper()
-    if p.startswith("XAU"):
+    core = pair.upper().split(".")[0]
+    if core.startswith("XAU"):
         return 0.01
-    return 0.01 if p.endswith("JPY") else 0.0001
+    return 0.01 if core.endswith("JPY") else 0.0001
 
 def contract_size_for(pair: str) -> float:
     # XAU 1 lot = 100 oz ; FX 1 lot = 100,000 unités de base
