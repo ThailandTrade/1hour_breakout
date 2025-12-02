@@ -838,7 +838,7 @@ def main():
     ap.add_argument(
         "--best-exp-threshold",
         type=float,
-        default=1.5,
+        default=0.15,
         help="Seuil d'expectancy globale (R) pour le CSV 'all days = Y' (expR >= ce seuil)."
     )
     args = ap.parse_args()
