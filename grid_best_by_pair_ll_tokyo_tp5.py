@@ -774,56 +774,44 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
         line = f"{session},{pair_type},{pair},{tp}," + ",".join(flags_list)
         print(line)
 
-def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold: float = 1.5):
+def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold: float = 0.15):
     """
-    Affiche un CSV complémentaire pour les paires dont l'expectancy globale (expR)
-    dépasse un certain seuil, avec tous les jours marqués 'Y'.
-
-    Format :
-    SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI
-
-    Règle :
-    - On prend les lignes de best_rows (1 ligne par paire, déjà optimisée w1..w5).
-    - On garde celles dont :
-        - trades > 0
-        - session != "-"
-        - exp >= best_exp_threshold
-    - Pour ces paires, on choisit un TP dynamique :
-        TPk où pk (p1..p5) est maximal pour cette paire.
-    - On sort une ligne avec tous les jours = Y.
+    Même logique que le breakdown TP, mais sans les jours :
+    - On prend les paires du tableau recap best_rows.
+    - On garde celles dont expectancy globale (exp) >= seuil.
+    - On choisit le TP avec la MEILLEURE EXPECTANCY BRUTE parmi TP1..TP5 pour cette paire.
+    - On affiche SESSION,TYPE,PAIR,TP,Y,Y,Y,Y,Y
     """
-    # Filtrage des paires "haut rendement"
-    candidates = [
-        r for r in best_rows
-        if r.get("trades", 0) > 0
-        and r.get("session", "-") != "-"
-        and r.get("exp", 0.0) >= best_exp_threshold
-    ]
 
-    if not candidates:
-        print(f"\nAucune paire avec expectancy globale >= {best_exp_threshold:.2f}R pour le CSV 'all days = Y'.")
-        return
+    print("\nSESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
 
-    print(f"\n# CSV des paires avec expectancy globale >= {best_exp_threshold:.2f}R (tous les jours = Y)")
-    print("SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
+    for r in best_rows:
+        # Filtrage sur ExpectancyR globale (comme demandé)
+        if r["exp"] < best_exp_threshold:
+            continue
 
-    # Tri propre par session, puis paire
-    candidates_sorted = sorted(candidates, key=lambda r: (r["session"], r["pair"]))
-
-    tp_labels = ["TP1", "TP2", "TP3", "TP4", "TP5"]
-
-    for r in candidates_sorted:
         session = r["session"]
-        pair    = r["pair"]
+        if session == "-":
+            continue
+
+        pair = r["pair"]
         pair_type = infer_type(pair)
 
-        # Choisir le TP avec la meilleure probabilité (p1..p5)
-        probs = [r["p1"], r["p2"], r["p3"], r["p4"], r["p5"]]
-        best_idx = max(range(5), key=lambda i: probs[i])
-        tp_label = tp_labels[best_idx]
+        # ➜ Déterminer le meilleur TP comme dans le breakdown :
+        #   le TP avec la meilleure expectancy brute (r['pX'] * X)
+        exp_by_tp = {
+            "TP1": r["p1"] * 1,
+            "TP2": r["p2"] * 2,
+            "TP3": r["p3"] * 3,
+            "TP4": r["p4"] * 4,
+            "TP5": r["p5"] * 5,
+        }
 
-        line = f"{session},{pair_type},{pair},{tp_label},Y,Y,Y,Y,Y"
-        print(line)
+        best_tp = max(exp_by_tp, key=lambda tp: exp_by_tp[tp])
+
+        # ➜ Impression console uniquement
+        print(f"{session},{pair_type},{pair},{best_tp},Y,Y,Y,Y,Y")
+
 
 
 
