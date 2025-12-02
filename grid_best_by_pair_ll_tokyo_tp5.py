@@ -788,8 +788,9 @@ def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold
         - trades > 0
         - session != "-"
         - exp >= best_exp_threshold
-    - Pour ces paires, on sort une ligne avec tous les jours = Y.
-      (TP est fixé ici à 'TP3' par défaut, à adapter si tu veux.)
+    - Pour ces paires, on choisit un TP dynamique :
+        TPk où pk (p1..p5) est maximal pour cette paire.
+    - On sort une ligne avec tous les jours = Y.
     """
     # Filtrage des paires "haut rendement"
     candidates = [
@@ -809,16 +810,21 @@ def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold
     # Tri propre par session, puis paire
     candidates_sorted = sorted(candidates, key=lambda r: (r["session"], r["pair"]))
 
-    # Choix du TP par défaut pour ce CSV "full Y"
-    DEFAULT_TP_LABEL = "TP3"   # change ici si tu veux TP1, TP2, TP4, TP5...
+    tp_labels = ["TP1", "TP2", "TP3", "TP4", "TP5"]
 
     for r in candidates_sorted:
         session = r["session"]
         pair    = r["pair"]
         pair_type = infer_type(pair)
 
-        line = f"{session},{pair_type},{pair},{DEFAULT_TP_LABEL},Y,Y,Y,Y,Y"
+        # Choisir le TP avec la meilleure probabilité (p1..p5)
+        probs = [r["p1"], r["p2"], r["p3"], r["p4"], r["p5"]]
+        best_idx = max(range(5), key=lambda i: probs[i])
+        tp_label = tp_labels[best_idx]
+
+        line = f"{session},{pair_type},{pair},{tp_label},Y,Y,Y,Y,Y"
         print(line)
+
 
 
 # ---------------- Main ----------------
