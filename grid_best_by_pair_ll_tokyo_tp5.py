@@ -774,6 +774,52 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
         line = f"{session},{pair_type},{pair},{tp}," + ",".join(flags_list)
         print(line)
 
+def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold: float = 1.5):
+    """
+    Affiche un CSV complémentaire pour les paires dont l'expectancy globale (expR)
+    dépasse un certain seuil, avec tous les jours marqués 'Y'.
+
+    Format :
+    SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI
+
+    Règle :
+    - On prend les lignes de best_rows (1 ligne par paire, déjà optimisée w1..w5).
+    - On garde celles dont :
+        - trades > 0
+        - session != "-"
+        - exp >= best_exp_threshold
+    - Pour ces paires, on sort une ligne avec tous les jours = Y.
+      (TP est fixé ici à 'TP3' par défaut, à adapter si tu veux.)
+    """
+    # Filtrage des paires "haut rendement"
+    candidates = [
+        r for r in best_rows
+        if r.get("trades", 0) > 0
+        and r.get("session", "-") != "-"
+        and r.get("exp", 0.0) >= best_exp_threshold
+    ]
+
+    if not candidates:
+        print(f"\nAucune paire avec expectancy globale >= {best_exp_threshold:.2f}R pour le CSV 'all days = Y'.")
+        return
+
+    print(f"\n# CSV des paires avec expectancy globale >= {best_exp_threshold:.2f}R (tous les jours = Y)")
+    print("SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
+
+    # Tri propre par session, puis paire
+    candidates_sorted = sorted(candidates, key=lambda r: (r["session"], r["pair"]))
+
+    # Choix du TP par défaut pour ce CSV "full Y"
+    DEFAULT_TP_LABEL = "TP3"   # change ici si tu veux TP1, TP2, TP4, TP5...
+
+    for r in candidates_sorted:
+        session = r["session"]
+        pair    = r["pair"]
+        pair_type = infer_type(pair)
+
+        line = f"{session},{pair_type},{pair},{DEFAULT_TP_LABEL},Y,Y,Y,Y,Y"
+        print(line)
+
 
 # ---------------- Main ----------------
 def main():
@@ -788,6 +834,12 @@ def main():
         default="TOKYO",
         choices=["TOKYO", "LONDON", "NY"],
         help="Session à tester (TOKYO, LONDON ou NY). Défaut: TOKYO."
+    )
+    ap.add_argument(
+        "--best-exp-threshold",
+        type=float,
+        default=1.5,
+        help="Seuil d'expectancy globale (R) pour le CSV 'all days = Y' (expR >= ce seuil)."
     )
     args = ap.parse_args()
 
@@ -857,6 +909,9 @@ def main():
 
     # 5) Affichage breakdown pair / jour / TP au format CSV
     print_breakdown_table(breakdown_rows, exp_threshold=args.exp_threshold)
+    
+    # 6) Affichage CSV des paires "haut rendement" (expR globale >= seuil) avec tous les jours = Y
+    print_high_exp_pairs_csv(best_rows, best_exp_threshold=args.best_exp_threshold)
 
 if __name__ == "__main__":
     main()
