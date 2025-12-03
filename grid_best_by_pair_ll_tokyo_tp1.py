@@ -10,16 +10,16 @@ TOKYO,INDEX,GBPCAD,TP3,Y,N,N,N,Y
 RÈGLE (mise à jour) :
 - On détermine, pour chaque paire, le meilleur moment (session) pour LANCER un trade.
 - Par session (TOKYO/LONDON/NY), on prend AU PLUS 1 trade par (paire, jour) si l'entrée se produit dans la fenêtre de la session.
-- Peu importe quand le trade se termine (SL/RR1), on NE bloque PAS le jour suivant (pas d'anti-overlap cross-day).
+- Peu importe quand le trade se termine (SL/RR5), on NE bloque PAS le jour suivant (pas d'anti-overlap cross-day).
 
 Entrées & cibles (inchangé, sauf SL de l’entrée cf. plus bas) :
 - Entrées: mêmes règles (break strict, pullback antagoniste, entrée wick), SL = extrême (low/high) depuis le pullback (inclus).
-- Cible: RR1 (timestamp), arrêt au 1er SL ou RR1 (pour l’évaluation des hits).
+- Cibles: RR1 uniquement (les RR2..RR5 sont ignorés).
 - WIN/LOSS: WIN si TP1 < SL, sinon LOSS (indépendant des poids).
-- R-multiple: application événementielle des partiels (w1..w5), w1+...+w5=1 (mais ici w1=1, les autres 0).
+- R-multiple: application événementielle uniquement sur TP1 (w1=1, autres ignorés).
 - Sessions: TOKYO / LONDON / NY.
 - Sortie 1: tableau final trié par Expectancy (R) — 1 ligne = la meilleure combinaison par paire.
-- Sortie 2: breakdown Pair × Jour de la semaine × TP (TP unique) au format CSV, en ne gardant que les lignes
+- Sortie 2: breakdown Pair × Jour de la semaine × TP (TP1 uniquement) au format CSV, en ne gardant que les lignes
            où au moins un jour a une expectancy > 0.1.
 
 I/O:
@@ -39,7 +39,6 @@ from collections import defaultdict
 from dotenv import load_dotenv
 import psycopg2
 from psycopg2 import extensions as pg_ext
-from datetime import datetime, timedelta, timezone, date
 from zoneinfo import ZoneInfo
 
 UTC = timezone.utc
@@ -82,31 +81,19 @@ def day_ms_bounds(d: date) -> Tuple[int, int]:
 # ---- Sessions (fenêtres UTC) ----
 def tokyo_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=1)).timestamp()*1000)                 # 01:00
-    end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)    # 05:45
+    start = int((base + timedelta(hours=1)).timestamp()*1000)
+    end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)
     return start, end
 
 def london_signal_window(d: date) -> Tuple[int, int]:
-    """
-    Fenêtre de signal LONDON définie en heure locale Londres (Europe/London),
-    avec gestion automatique été/hiver.
-    Exemple : 08:00–14:45 heure de Londres.
-    """
-    # Date + heure en heure locale Londres
     local_start = datetime(d.year, d.month, d.day, 8, 0, tzinfo=LONDON_TZ)
     local_end   = datetime(d.year, d.month, d.day, 12, 45, tzinfo=LONDON_TZ)
-
-    # Conversion en UTC (avec le bon offset selon été/hiver)
-    start_utc = local_start.astimezone(UTC)
-    end_utc   = local_end.astimezone(UTC)
-
-    return int(start_utc.timestamp() * 1000), int(end_utc.timestamp() * 1000)
-
+    return int(local_start.astimezone(UTC).timestamp() * 1000), int(local_end.astimezone(UTC).timestamp() * 1000)
 
 def ny_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 13:00
-    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 17:45
+    start = int((base + timedelta(hours=13)).timestamp()*1000)
+    end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)
     return start, end
 
 def window_for_session(session: str, d: date) -> Tuple[int, int]:
@@ -135,32 +122,13 @@ def pip_size_for(pair: str) -> float:
     return 0.01 if core.endswith("JPY") else 0.0001
 
 def infer_type(pair: str) -> str:
-    """
-    Heuristique simple pour TYPE: FOREX / METAL / INDEX / CRYPTO
-    (Tu pourras ajuster la liste en fonction de tes instruments exacts.)
-    """
     up = pair.upper()
-
-    # Metals
-    if up.startswith("XAU") or up.startswith("XAG") or up.startswith("XPT") or up.startswith("XPD"):
+    if up.startswith(("XAU", "XAG", "XPT", "XPD")):
         return "METAL"
-
-    # Index (liste à compléter si besoin)
-    index_symbols = {
-        "NAS100", "US30", "US500", "SPX500", "GER40", "UK100", "FRA40",
-        "JPN225", "JP225", "HK50"
-    }
-    if up in index_symbols:
+    if up in {"NAS100","US30","US500","SPX500","GER40","UK100","FRA40","JPN225","JP225","HK50"}:
         return "INDEX"
-
-    # Crypto (liste à compléter si besoin)
-    crypto_symbols = {
-        "BTCUSD", "ETHUSD", "LTCUSD", "XRPUSD", "ADAUSD", "SOLUSD"
-    }
-    if up in crypto_symbols:
+    if up in {"BTCUSD","ETHUSD","LTCUSD","XRPUSD","ADAUSD","SOLUSD"}:
         return "CRYPTO"
-
-    # Par défaut
     return "FOREX"
 
 # ---------------- DB Readers ----------------
@@ -180,348 +148,174 @@ def read_first_1h(conn, pair: str, d: date) -> Optional[Dict]:
 
 def read_15m_in(conn, pair: str, start_ms: int, end_ms: int) -> List[Dict]:
     t15 = table_name(pair, "15m")
-    sql = f"""
-        SELECT ts, open, high, low, close
-        FROM {t15}
-        WHERE ts >= %s AND ts <= %s
-        ORDER BY ts ASC
-    """
+    sql = f"SELECT ts, open, high, low, close FROM {t15} WHERE ts >= %s AND ts <= %s ORDER BY ts ASC"
     try:
         with conn.cursor() as cur:
             cur.execute(sql, (start_ms, end_ms))
             rows = cur.fetchall()
-            return [{"ts": int(ts), "open": float(o), "high": float(h),
-                     "low": float(l), "close": float(c)} for ts,o,h,l,c in rows]
+            return [{"ts": int(ts), "open": float(o), "high": float(h),"low": float(l), "close": float(c)} for ts,o,h,l,c in rows]
     except Exception:
         conn.rollback(); return []
 
 def read_15m_from(conn, pair: str, start_ms: int) -> List[Dict]:
     t15 = table_name(pair, "15m")
-    sql = f"""
-        SELECT ts, open, high, low, close
-        FROM {t15}
-        WHERE ts > %s
-        ORDER BY ts ASC
-    """
+    sql = f"SELECT ts, high, low FROM {t15} WHERE ts > %s ORDER BY ts ASC"
     try:
         with conn.cursor() as cur:
             cur.execute(sql, (start_ms,))
             rows = cur.fetchall()
-            return [{"ts": int(ts), "open": float(o), "high": float(h),
-                     "low": float(l), "close": float(c)} for ts,o,h,l,c in rows]
+            return [{"ts": int(ts), "high": float(h), "low": float(l)} for ts,h,l in rows]
     except Exception:
         conn.rollback(); return []
 
-# ---------------- FSM / Trade (CORE LOGIC — DO NOT CHANGE sauf SL depuis pullback) ----------------
+# ---------------- FSM / Trade ----------------
 @dataclass
 class Trade:
-    side: str              # "LONG" | "SHORT"
-    entry_ts: int          # ts OPEN UTC of trigger bar
+    side: str
+    entry_ts: int
     entry: float
     sl: float
 
 def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
-    # Activation long/short + pullback antagoniste + wick trigger; SL = lowest/highest depuis pullback (inclus)
-    long_active = False
-    long_hh: Optional[float] = None
-    long_pullback_idx: Optional[int] = None
-    long_min_low_since_pullback: Optional[float] = None  # suivi du plus bas depuis pullback (inclus)
-
-    short_active = False
-    short_ll: Optional[float] = None
-    short_pullback_idx: Optional[int] = None
-    short_max_high_since_pullback: Optional[float] = None  # suivi du plus haut depuis pullback (inclus)
-
+    long_active = short_active = False
+    long_hh = short_ll = None
+    long_pullback_idx = short_pullback_idx = None
+    long_min_low_since_pullback = short_max_high_since_pullback = None
     for i, b in enumerate(c15):
         ts, o, h, l, c = b["ts"], b["open"], b["high"], b["low"], b["close"]
-
-        if (not long_active) and (c > range_high):
-            long_active = True
-            long_hh = h
-            long_pullback_idx = None
-            long_min_low_since_pullback = None
-
-        if (not short_active) and (c < range_low):
-            short_active = True
-            short_ll = l
-            short_pullback_idx = None
-            short_max_high_since_pullback = None
-
-        # -------- LONG --------
+        if not long_active and c > range_high:
+            long_active = True; long_hh = h
+        if not short_active and c < range_low:
+            short_active = True; short_ll = l
         if long_active:
-            prev_hh = long_hh
-            if long_pullback_idx is None and (c < o):
-                long_pullback_idx = i
-                long_min_low_since_pullback = l  # inclut la bougie de pullback
-            if long_pullback_idx is not None and i >= 1:
-                prev_low = c15[i-1]["low"]
-                long_min_low_since_pullback = prev_low if long_min_low_since_pullback is None else min(long_min_low_since_pullback, prev_low)
-            if (prev_hh is not None) and (long_pullback_idx is not None) and (i > long_pullback_idx) and (h > prev_hh) and (i >= 1):
-                entry_price = prev_hh
-                sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
-                return Trade("LONG", ts, entry_price, sl_price)
-            if (long_hh is None) or (h > long_hh):
-                long_hh = h
-
-        # -------- SHORT --------
+            if long_pullback_idx is None and c < o:
+                long_pullback_idx = i; long_min_low_since_pullback = l
+            if long_pullback_idx is not None and i > long_pullback_idx and h > long_hh:
+                entry = long_hh; sl = long_min_low_since_pullback or l
+                return Trade("LONG", ts, entry, sl)
+            long_hh = max(long_hh or h, h)
         if short_active:
-            prev_ll = short_ll
-            if short_pullback_idx is None and (c > o):
-                short_pullback_idx = i
-                short_max_high_since_pullback = h  # inclut la bougie de pullback
-            if short_pullback_idx is not None and i >= 1:
-                prev_high = c15[i-1]["high"]
-                short_max_high_since_pullback = prev_high if short_max_high_since_pullback is None else max(short_max_high_since_pullback, prev_high)
-            if (prev_ll is not None) and (short_pullback_idx is not None) and (i > short_pullback_idx) and (l < prev_ll) and (i >= 1):
-                entry_price = prev_ll
-                sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
-                return Trade("SHORT", ts, entry_price, sl_price)
-            if (short_ll is None) or (l < short_ll):
-                short_ll = l
-
+            if short_pullback_idx is None and c > o:
+                short_pullback_idx = i; short_max_high_since_pullback = h
+            if short_pullback_idx is not None and i > short_pullback_idx and l < short_ll:
+                entry = short_ll; sl = short_max_high_since_pullback or h
+                return Trade("SHORT", ts, entry, sl)
+            short_ll = min(short_ll or l, l)
     return None
 
-# ---------------- After-entry evaluation (CORE LOGIC — TP1 ONLY) ----------------
+# ---------------- After-entry evaluation ----------------
 def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
-    """
-    Enregistre les timestamps de RR1/SL; stop au premier SL ou RR1.
-    """
     eps = pip_eps_for(pair)
     entry, sl = tr.entry, tr.sl
     r = abs(entry - sl)
     if r <= 0:
-        targets = {"RR1": entry}
-        results = {"RR1": "SL"}
-        return targets, results, {"SL": None, "RR1": None}, None
-
-    if tr.side == "LONG":
-        t1 = entry + 1.0 * r
-    else:
-        t1 = entry - 1.0 * r
-
-    targets = {"RR1": t1}
-    hit_time: Dict[str, Optional[int]] = {"SL": None, "RR1": None}
-
+        targets = {"RR1": entry, "RR2": entry, "RR3": entry, "RR4": entry, "RR5": entry}
+        results = {k: "SL" for k in targets}
+        return targets, results, {"SL": None, "RR1": None, "RR2": None, "RR3": None, "RR4": None, "RR5": None}, None
+    # seules les cibles RR1 sont utilisées
+    if tr.side == "LONG": t1 = entry + r
+    else: t1 = entry - r
+    targets = {"RR1": t1, "RR2": t1, "RR3": t1, "RR4": t1, "RR5": t1}
+    hit_time = {"SL": None, "RR1": None, "RR2": None, "RR3": None, "RR4": None, "RR5": None}
     future = read_15m_from(conn, pair, tr.entry_ts)
     for b in future:
         ts, h, l = b["ts"], b["high"], b["low"]
         if tr.side == "LONG":
-            sl_hit  = (l <= sl + eps)
-            rr1_hit = (h >= t1 - eps)
+            if l <= sl + eps and hit_time["SL"] is None: hit_time["SL"] = ts
+            if h >= t1 - eps and hit_time["RR1"] is None: hit_time["RR1"] = ts
         else:
-            sl_hit  = (h >= sl - eps)
-            rr1_hit = (l <= t1 + eps)
-
-        if hit_time["SL"]  is None and sl_hit:
-            hit_time["SL"]  = ts
-        if hit_time["RR1"] is None and rr1_hit:
-            hit_time["RR1"] = ts
-
-        # Stop au premier SL ou RR1
-        if (hit_time["SL"] is not None) or (hit_time["RR1"] is not None):
-            break
-
-    results: Dict[str, str] = {}
+            if h >= sl - eps and hit_time["SL"] is None: hit_time["SL"] = ts
+            if l <= t1 + eps and hit_time["RR1"] is None: hit_time["RR1"] = ts
+        if hit_time["SL"] or hit_time["RR1"]: break
+    results = {k: "SL" for k in targets}
     sl_time = hit_time["SL"]
-    t1_time = hit_time["RR1"]
-    results["RR1"] = "TP" if (t1_time is not None and (sl_time is None or t1_time < sl_time)) else "SL"
-
-    closed_ts = sl_time if sl_time is not None else hit_time["RR1"]
+    for key in ["RR1"]:
+        ttime = hit_time[key]
+        results[key] = "TP" if (ttime and (not sl_time or ttime < sl_time)) else "SL"
+    closed_ts = hit_time["SL"] or hit_time["RR1"]
     return targets, results, hit_time, closed_ts
 
-# ---------------- Partials (TP1 ONLY) ----------------
-def compute_r_and_close(hit_time: Dict[str, Optional[int]],
-                        w1: float, w2: float, w3: float, w4: float, w5: float) -> float:
-    """
-    Système TP1 only :
-      +1 R si RR1 atteint avant SL
-      -1 R sinon.
-    Les poids w2..w5 sont ignorés (w1=1, les autres 0 dans la grille).
-    """
-    t_sl = hit_time.get("SL")
-    t1   = hit_time.get("RR1")
-
+# ---------------- compute_r_and_close ----------------
+def compute_r_and_close(hit_time: Dict[str, Optional[int]], w1: float, w2: float, w3: float, w4: float, w5: float) -> float:
+    t_sl = hit_time.get("SL"); t1 = hit_time.get("RR1")
+    rem = 1.0; r = 0.0
     if t1 is not None and (t_sl is None or t1 < t_sl):
-        return 1.0
-    else:
-        return -1.0
+        r += w1 * 1.0; rem -= w1
+    elif t_sl is not None:
+        r -= rem
+    return r
 
 def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
-    t = hits.get(key)
-    sl = hits.get("SL")
+    t = hits.get(key); sl = hits.get("SL")
     return t is not None and (sl is None or t < sl)
 
-# ---------------- Core: générer les trades (par session) ----------------
+# ---------------- Core Trade Generation ----------------
 @dataclass
 class BareTrade:
-    # {"SL": ts|None, "RR1": ts|None}
     hits: Dict[str, Optional[int]]
-    entry_ts: int                   # ts OPEN UTC de la bougie de trigger
+    entry_ts: int
 
 def collect_trades_for_session(conn, pair: str, start: date, end: date, session: str) -> List[BareTrade]:
-    """
-    Règle: on prend AU PLUS UN trade par (paire, jour) si l'entrée est dans la fenêtre de la session.
-    **MOD TOKYO ONLY**: tant que le trade n'est pas clôturé (TP1 ou SL), on BLOQUE les jours suivants.
-    """
-    trades: List[BareTrade] = []
-
-    # cross-day blocking
-    block_until_ts: Optional[int] = None  # ts de clôture (SL ou RR1) du dernier trade
-
+    trades = []
     for d in daterange(start, end):
-        # 2) Fenêtre 15m de la session pour ce jour
         s, e = window_for_session(session, d)
-
-        # Si un trade précédent est encore "ouvert" au début de cette fenêtre, on saute ce jour
-        if block_until_ts is not None and s <= block_until_ts:
-            continue
-
-        # 1) Range H1 du jour (00:00–01:00 UTC)
         c1 = read_first_1h(conn, pair, d)
-        if not c1:
-            continue
+        if not c1: continue
         rh, rl = c1["high"], c1["low"]
-
         c15 = read_15m_in(conn, pair, s, e)
-        if not c15:
-            continue
-
-        # 3) Détecte le PREMIER trade dans la fenêtre (un seul par jour)
+        if not c15: continue
         tr = detect_first_trade_for_day(c15, rh, rl)
-        if not tr:
-            continue
-
-        # 4) Enregistre les hits pour calculer R/TP% ET récupérer le closed_ts
+        if not tr: continue
         _, _, hits, closed_ts = evaluate_trade_after_entry(conn, pair, tr)
         trades.append(BareTrade(hits=hits, entry_ts=tr.entry_ts))
-
-        # 5) Cross-day blocking: BLOQUE jusqu'à SL ou RR1
-        block_until_ts = closed_ts if closed_ts is not None else (2**62)
-
-        # 6) Passe au jour suivant (jamais de 2e trade ce jour)
-        continue
-
     return trades
 
-# ---------------- Grille des poids ----------------
+# ---------------- weight_grid (inchangé) ----------------
 def weight_grid(step: float = 0.1):
-    """
-    Génère les combinaisons (w1..w5) avec:
-      w1 = 1.0
-      w2 = w3 = w4 = w5 = 0.0
+    vals = [round(i * step, 1) for i in range(int(1/step) + 1)]
+    for w1 in vals:
+        yield (w1, 0.0, 0.0, 0.0, round(1.0 - w1, 1))
 
-    (TP1 only)
-    """
-    yield (1.0, 0.0, 0.0, 0.0, 0.0)
-
-# ---------------- Stats pour une combinaison ----------------
-def stats_for_weights(trades: List[BareTrade],
-                      w1: float, w2: float, w3: float, w4: float, w5: float) -> Dict[str, Any]:
+# ---------------- stats_for_weights ----------------
+def stats_for_weights(trades: List[BareTrade], w1: float, w2: float, w3: float, w4: float, w5: float) -> Dict[str, Any]:
     total = len(trades)
     if total == 0:
-        return {
-            "trades": 0, "winrate": 0.0,
-            "avg_win": 0.0, "avg_loss": 0.0, "exp": 0.0,
-            "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0, "p5": 0.0
-        }
-
-    r_wins: List[float] = []
-    r_losses_abs: List[float] = []
-
+        return {"trades": 0,"winrate": 0.0,"avg_win": 0.0,"avg_loss": 0.0,"exp": 0.0,"p1": 0.0,"p2": 0.0,"p3": 0.0,"p4": 0.0,"p5": 0.0}
+    r_wins, r_losses_abs = [], []
     tp1_cnt = 0
-
     for bt in trades:
         hits = bt.hits
-        if reached_before(hits, "RR1"):
-            tp1_cnt += 1
+        if reached_before(hits, "RR1"): tp1_cnt += 1
+        r_mult = compute_r_and_close(hits, w1, 0, 0, 0, 0)
+        if reached_before(hits, "RR1"): r_wins.append(r_mult)
+        else: r_losses_abs.append(-r_mult)
+    wins = len(r_wins); losses = len(r_losses_abs)
+    winrate = wins/total if total>0 else 0
+    avg_win = sum(r_wins)/wins if wins>0 else 0
+    avg_loss = sum(r_losses_abs)/losses if losses>0 else 0
+    expectancy = winrate*avg_win - (1-winrate)*avg_loss
+    return {"trades": total,"winrate": winrate,"avg_win": avg_win,"avg_loss": avg_loss,"exp": expectancy,"p1": tp1_cnt/total,"p2": 0,"p3": 0,"p4": 0,"p5": 0}
 
-        r_mult = compute_r_and_close(hits, w1, w2, w3, w4, w5)
-
-        # WIN/LOSS = TP1 avant SL
-        if reached_before(hits, "RR1"):
-            r_wins.append(r_mult)
-        else:
-            r_losses_abs.append(-r_mult)
-
-    wins = len(r_wins)
-    losses = len(r_losses_abs)
-    winrate = (wins / total) if total > 0 else 0.0
-    avg_win = (sum(r_wins)/wins) if wins > 0 else 0.0
-    avg_loss = (sum(r_losses_abs)/losses) if losses > 0 else 0.0
-    expectancy = winrate * avg_win - (1.0 - winrate) * avg_loss
-
-    p1 = tp1_cnt / total
-    p2 = 0.0
-    p3 = 0.0
-    p4 = 0.0
-    p5 = 0.0
-
-    return {
-        "trades": total,
-        "winrate": winrate,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "exp": expectancy,
-        "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5
-    }
-
-# ---------------- Breakdown Pair / Jour / TP (TP unique) ----------------
+# ---------------- Breakdown TP1 only ----------------
 def build_breakdown_rows_for_pair(pair: str, session: str, trades: List[BareTrade]) -> List[Dict[str, Any]]:
-    """
-    Breakdown par paire / jour de la semaine / TP :
-    - On considère un TP UNIQUE (TP1).
-    - R-multiple simple : +1 R si TP1 avant SL, sinon -1 R.
-    """
-    buckets = defaultdict(lambda: {"trades": 0, "wins": 0, "sum_r": 0.0})
-
+    buckets = defaultdict(lambda: {"trades": 0,"wins": 0,"sum_r": 0.0})
     for bt in trades:
         hits = bt.hits
-        # jour d'entrée du trade (UTC)
         dt = datetime.fromtimestamp(bt.entry_ts / 1000, tz=UTC)
-        dow_idx = dt.weekday()          # 0=MON, 6=SUN
-        dow_name = WEEKDAYS[dow_idx]
-
-        t_sl = hits.get("SL")
-
-        # TP1 uniquement
-        tp_key, k, tp_label = ("RR1", 1, "TP1")
-        bucket_key = (dow_name, tp_label)
+        dow_name = WEEKDAYS[dt.weekday()]
+        t_sl = hits.get("SL"); t_tp = hits.get("RR1")
+        bucket_key = (dow_name, "TP1")
         buckets[bucket_key]["trades"] += 1
-
-        t_tp = hits.get(tp_key)
-        if (t_tp is not None) and (t_sl is None or t_tp < t_sl):
-            r = float(k)  # TP1 atteint avant SL
-            buckets[bucket_key]["wins"] += 1
-        else:
-            r = -1.0      # SL avant (ou TP jamais atteint)
-
+        if (t_tp and (not t_sl or t_tp < t_sl)):
+            r = 1.0; buckets[bucket_key]["wins"] += 1
+        else: r = -1.0
         buckets[bucket_key]["sum_r"] += r
-
-    rows: List[Dict[str, Any]] = []
-
-    # Tri par jour puis TP
-    def sort_key(item):
-        (dow_name, tp_label) = item[0]
-        return (WEEKDAYS.index(dow_name), tp_label)
-
-    for (dow_name, tp_label), agg in sorted(buckets.items(), key=sort_key):
-        total = agg["trades"]
-        if total == 0:
-            continue
-        wins = agg["wins"]
-        winrate = wins / total
-        avg_r = agg["sum_r"] / total  # expectancy R moyen avec ce TP unique
-
-        rows.append({
-            "pair": pair,
-            "session": session,
-            "dow": dow_name,
-            "tp": tp_label,
-            "trades": total,
-            "winrate": winrate,
-            "expectancy": avg_r,
-        })
-
+    rows=[]
+    for (dow_name,tp_label),agg in sorted(buckets.items(),key=lambda x:(WEEKDAYS.index(x[0][0]),x[0][1])):
+        total=agg["trades"]; 
+        if total==0: continue
+        wins=agg["wins"]; avg_r=agg["sum_r"]/total
+        rows.append({"pair":pair,"session":session,"dow":dow_name,"tp":tp_label,"trades":total,"winrate":wins/total,"expectancy":avg_r})
     return rows
 
 # ---------------- Chargement des paires ----------------
@@ -620,7 +414,7 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
     SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI
 
     Règle:
-    - Pour chaque (session, pair, jour), on choisit le TP (ici TP1) avec la meilleure expectancy.
+    - Pour chaque (session, pair, jour), on choisit le TP (TP1..TP5) avec la meilleure expectancy.
     - On met Y sur ce TP si son expectancy > exp_threshold, sinon N.
     - Un seul TP peut être Y par jour et par paire/session.
     - On ne garde que les lignes (session, pair, TP) avec au moins un Y.
@@ -639,7 +433,7 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
         session = r["session"]
         pair    = r["pair"]
         dow     = r["dow"]
-        tp      = r["tp"]   # "TP1"
+        tp      = r["tp"]   # "TP1" ... "TP5"
         exp     = r["expectancy"]
 
         if dow not in valid_days:
@@ -659,7 +453,7 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
             tps = day_map.get(d, {})
             best_tp = None
             best_exp = None
-            for tp in ["TP1"]:
+            for tp in ["TP1", "TP2", "TP3", "TP4", "TP5"]:
                 e = tps.get(tp)
                 if e is None:
                     continue
@@ -673,7 +467,7 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
     final_flags: Dict[Tuple[str, str, str], Dict[str, str]] = {}
 
     for (session, pair, d), (tp_best, exp_best) in best_tp_per_spd.items():
-        for tp in ["TP1"]:
+        for tp in ["TP1", "TP2", "TP3", "TP4", "TP5"]:
             key = (session, pair, tp)
             if key not in final_flags:
                 final_flags[key] = {day: "N" for day in valid_days}
@@ -734,6 +528,10 @@ def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold
 
         # 3) Impression console
         print(f"{session},{pair_type},{pair},{best_tp},Y,Y,Y,Y,Y")
+
+
+
+
 
 # ---------------- Main ----------------
 def main():
@@ -829,3 +627,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
