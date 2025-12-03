@@ -776,17 +776,21 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
 
 def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold: float = 0.15):
     """
-    Même logique que le breakdown TP, mais sans les jours :
-    - On prend les paires du tableau recap best_rows.
-    - On garde celles dont expectancy globale (exp) >= seuil.
-    - On choisit le TP avec la MEILLEURE EXPECTANCY BRUTE parmi TP1..TP5 pour cette paire.
-    - On affiche SESSION,TYPE,PAIR,TP,Y,Y,Y,Y,Y
+    CSV global basé sur le tableau recap (best_rows) :
+
+    - On filtre les paires dont l'expectancy globale (exp) >= best_exp_threshold.
+    - On choisit le TP correspondant AU POIDS DOMINANT (w1..w5) de cette paire.
+      -> w1 max  => TP1
+      -> w2 max  => TP2
+      -> ...
+      -> w5 max  => TP5
+    - On affiche : SESSION,TYPE,PAIR,TP,Y,Y,Y,Y,Y
     """
 
     print("\nSESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
 
     for r in best_rows:
-        # Filtrage sur ExpectancyR globale (comme demandé)
+        # 1) Filtre sur l'ExpectancyR globale du recap
         if r["exp"] < best_exp_threshold:
             continue
 
@@ -797,20 +801,19 @@ def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold
         pair = r["pair"]
         pair_type = infer_type(pair)
 
-        # ➜ Déterminer le meilleur TP comme dans le breakdown :
-        #   le TP avec la meilleure expectancy brute (r['pX'] * X)
-        exp_by_tp = {
-            "TP1": r["p1"] * 1,
-            "TP2": r["p2"] * 2,
-            "TP3": r["p3"] * 3,
-            "TP4": r["p4"] * 4,
-            "TP5": r["p5"] * 5,
-        }
+        # 2) Choix du TP via le POIDS dominant w1..w5
+        weights = [
+            ("TP1", r["w1"]),
+            ("TP2", r["w2"]),
+            ("TP3", r["w3"]),
+            ("TP4", r["w4"]),
+            ("TP5", r["w5"]),
+        ]
+        best_tp, _ = max(weights, key=lambda x: x[1])  # max sur le poids
 
-        best_tp = max(exp_by_tp, key=lambda tp: exp_by_tp[tp])
-
-        # ➜ Impression console uniquement
+        # 3) Impression console
         print(f"{session},{pair_type},{pair},{best_tp},Y,Y,Y,Y,Y")
+
 
 
 
