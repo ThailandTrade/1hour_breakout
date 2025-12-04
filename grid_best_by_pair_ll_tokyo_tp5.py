@@ -12,23 +12,17 @@ RÈGLE (mise à jour) :
 - Par session (TOKYO/LONDON/NY), on prend AU PLUS 1 trade par (paire, jour) si l'entrée se produit dans la fenêtre de la session.
 - Peu importe quand le trade se termine (SL/RR5), on NE bloque PAS le jour suivant (pas d'anti-overlap cross-day).
 
-Entrées & cibles (inchangé, sauf SL de l’entrée cf. plus bas) :
+CRITÈRES DE SÉLECTION INCLUS (dans le tableau final) :
+- Expectancy R (Exp)
+- Winrate
+- Profit Factor (PF)
+
+Entrées & cibles :
 - Entrées: mêmes règles (break strict, pullback antagoniste, entrée wick), SL = extrême (low/high) depuis le pullback (inclus).
 - Cibles: RR1 / RR2 / RR3 / RR4 / RR5 (timestamps), arrêt au 1er SL ou RR5 (pour l’évaluation des hits).
-- WIN/LOSS: WIN si TP1 < SL, sinon LOSS (indépendant des poids).
 - R-multiple: application événementielle des partiels (w1..w5), w1+...+w5=1.
-- Sessions: TOKYO / LONDON / NY.
-- Sortie 1: tableau final trié par Expectancy (R) — 1 ligne = la meilleure combinaison par paire.
-- Sortie 2: breakdown Pair × Jour de la semaine × TP (TP unique) au format CSV, en ne gardant que les lignes
-           où au moins un jour a une expectancy > 0.1.
 
-I/O:
-- Lit les paires depuis --pairs-file (default: pairs_5ers.txt). Format simple: une paire par ligne,
-  ou CSV avec une colonne "pair"/"pairs". Dédoublonnage automatique.
-- Pas de sizing ni de frais: optimisation pure en R.
-
-Usage:
-  python grid_best_by_pair.py --pairs-file pairs_5ers.txt --start-date 2025-01-01 --end-date 2025-12-31
+*** AJOUT DU FILTRE EMA 200 DAILY (Lecture DB) : LONG si entrée > EMA, SHORT si entrée < EMA. ***
 """
 
 import os, sys, argparse, csv
@@ -45,6 +39,10 @@ from zoneinfo import ZoneInfo
 UTC = timezone.utc
 WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 LONDON_TZ = ZoneInfo("Europe/London")
+
+# --- CONFIG NOM COLONNE DB ---
+# Assurez-vous que votre table _d1 contient bien cette colonne
+EMA_COL_NAME = "ema_200"
 
 # ---------------- ENV / DB ----------------
 load_dotenv()
@@ -82,7 +80,7 @@ def day_ms_bounds(d: date) -> Tuple[int, int]:
 # ---- Sessions (fenêtres UTC) ----
 def tokyo_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=1)).timestamp()*1000)                 # 01:00
+    start = int((base + timedelta(hours=1)).timestamp()*1000)        # 01:00
     end   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)    # 05:45
     return start, end
 
@@ -105,7 +103,7 @@ def london_signal_window(d: date) -> Tuple[int, int]:
 
 def ny_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    start = int((base + timedelta(hours=13)).timestamp()*1000)               # 13:00
+    start = int((base + timedelta(hours=13)).timestamp()*1000)       # 13:00
     end   = int((base + timedelta(hours=17, minutes=45)).timestamp()*1000)   # 17:45
     return start, end
 
@@ -137,7 +135,6 @@ def pip_size_for(pair: str) -> float:
 def infer_type(pair: str) -> str:
     """
     Heuristique simple pour TYPE: FOREX / METAL / INDEX / CRYPTO
-    (Tu pourras ajuster la liste en fonction de tes instruments exacts.)
     """
     up = pair.upper()
 
@@ -164,6 +161,31 @@ def infer_type(pair: str) -> str:
     return "FOREX"
 
 # ---------------- DB Readers ----------------
+
+def read_prev_daily_ema(conn, pair: str, current_day_start_ms: int) -> Optional[float]:
+    """
+    Récupère l'EMA 200 Daily directement depuis la DB.
+    On prend la dernière bougie D1 qui a un TS < au début de la journée actuelle.
+    Cela correspond à l'EMA de la veille (clôturée), pour éviter le look-ahead bias.
+    """
+    t_d1 = table_name(pair, "1d")
+    # On cherche la dernière bougie close avant le début de cette journée
+    sql = f"SELECT {EMA_COL_NAME} FROM {t_d1} WHERE ts < %s ORDER BY ts DESC LIMIT 1"
+    
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (current_day_start_ms,))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+            return None
+    except Exception:
+        # Si la colonne n'existe pas ou erreur SQL, on ignore (ou on log)
+        # conn.rollback() est important ici si on est dans une transaction, 
+        # mais ici on est en autocommit. Par sécurité :
+        conn.rollback() 
+        return None
+
 def read_first_1h(conn, pair: str, d: date) -> Optional[Dict]:
     t1h = table_name(pair, "1h")
     day_start, _ = day_ms_bounds(d)
@@ -212,15 +234,15 @@ def read_15m_from(conn, pair: str, start_ms: int) -> List[Dict]:
     except Exception:
         conn.rollback(); return []
 
-# ---------------- FSM / Trade (CORE LOGIC — DO NOT CHANGE sauf SL depuis pullback) ----------------
+# ---------------- FSM / Trade (CORE LOGIC) ----------------
 @dataclass
 class Trade:
-    side: str              # "LONG" | "SHORT"
-    entry_ts: int          # ts OPEN UTC of trigger bar
+    side: str            # "LONG" | "SHORT"
+    entry_ts: int        # ts OPEN UTC of trigger bar
     entry: float
     sl: float
 
-def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
+def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float, ema_daily: Optional[float]) -> Optional[Trade]:
     # Activation long/short + pullback antagoniste + wick trigger; SL = lowest/highest depuis pullback (inclus)
     long_active = False
     long_hh: Optional[float] = None
@@ -256,10 +278,25 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             if long_pullback_idx is not None and i >= 1:
                 prev_low = c15[i-1]["low"]
                 long_min_low_since_pullback = prev_low if long_min_low_since_pullback is None else min(long_min_low_since_pullback, prev_low)
+            
+            # TRIGGER LONG
             if (prev_hh is not None) and (long_pullback_idx is not None) and (i > long_pullback_idx) and (h > prev_hh) and (i >= 1):
                 entry_price = prev_hh
-                sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
-                return Trade("LONG", ts, entry_price, sl_price)
+                
+                # --- FILTRE EMA LONG ---
+                # Si EMA existe et Entry <= EMA, on rejette (on veut Entry > EMA)
+                if ema_daily is not None and entry_price <= ema_daily:
+                    # Filtre échoué, on ne prend pas le trade.
+                    # Note : on continue la boucle ou on reset ?
+                    # La règle est "AU PLUS 1 trade". Si le signal est là mais filtré, 
+                    # techniquement on a eu le signal. Ici on retourne None = pas de trade pris ce tick.
+                    # Mais comme la fonction cherche "le premier", si on ne le retourne pas ici,
+                    # la boucle continue. Si un autre setup se présente plus tard et passe l'EMA, il sera pris.
+                    pass 
+                else:
+                    sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
+                    return Trade("LONG", ts, entry_price, sl_price)
+
             if (long_hh is None) or (h > long_hh):
                 long_hh = h
 
@@ -272,16 +309,25 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             if short_pullback_idx is not None and i >= 1:
                 prev_high = c15[i-1]["high"]
                 short_max_high_since_pullback = prev_high if short_max_high_since_pullback is None else max(short_max_high_since_pullback, prev_high)
+            
+            # TRIGGER SHORT
             if (prev_ll is not None) and (short_pullback_idx is not None) and (i > short_pullback_idx) and (l < prev_ll) and (i >= 1):
                 entry_price = prev_ll
-                sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
-                return Trade("SHORT", ts, entry_price, sl_price)
+
+                # --- FILTRE EMA SHORT ---
+                # Si EMA existe et Entry >= EMA, on rejette (on veut Entry < EMA)
+                if ema_daily is not None and entry_price >= ema_daily:
+                    pass
+                else:
+                    sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
+                    return Trade("SHORT", ts, entry_price, sl_price)
+
             if (short_ll is None) or (l < short_ll):
                 short_ll = l
 
     return None
 
-# ---------------- After-entry evaluation (CORE LOGIC — DO NOT CHANGE sauf extension RR4/RR5) ----------------
+# ---------------- After-entry evaluation (CORE LOGIC) ----------------
 def evaluate_trade_after_entry(conn, pair: str, tr: Trade):
     """
     Enregistre les timestamps de RR1/RR2/RR3/RR4/RR5/SL; stop au premier SL ou RR5.
@@ -353,12 +399,6 @@ def compute_r_and_close(hit_time: Dict[str, Optional[int]],
                         w1: float, w2: float, w3: float, w4: float, w5: float) -> float:
     """
     Application temporelle des sorties partielles (w1+...+w5=1):
-      TP1: +w1 * 1R ; rem -= w1
-      TP2: +w2 * 2R ; rem -= w2
-      TP3: +w3 * 3R ; rem -= w3
-      TP4: +w4 * 4R ; rem -= w4
-      TP5: +w5 * 5R ; rem -= w5
-      SL : -1R * rem
     Renvoie le R-multiple total.
     """
     t_sl = hit_time.get("SL")
@@ -419,12 +459,11 @@ def reached_before(hits: Dict[str, Optional[int]], key: str) -> bool:
 class BareTrade:
     # {"SL": ts|None, "RR1": ts|None, ... "RR5": ts|None}
     hits: Dict[str, Optional[int]]
-    entry_ts: int                   # ts OPEN UTC de la bougie de trigger
+    entry_ts: int                     # ts OPEN UTC de la bougie de trigger
 
 def collect_trades_for_session(conn, pair: str, start: date, end: date, session: str) -> List[BareTrade]:
     """
     Règle: on prend AU PLUS UN trade par (paire, jour) si l'entrée est dans la fenêtre de la session.
-    **MOD TOKYO ONLY**: tant que le trade n'est pas clôturé (TP5 ou SL), on BLOQUE les jours suivants.
     """
     trades: List[BareTrade] = []
 
@@ -432,14 +471,19 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
     block_until_ts: Optional[int] = None  # ts de clôture (SL ou RR5) du dernier trade
 
     for d in daterange(start, end):
+        # 1) Fetch D1 EMA (200) depuis la DB pour ce jour
+        # On passe le start_ms du jour pour trouver l'EMA précédente
+        day_start_ms, _ = day_ms_bounds(d)
+        ema_val = read_prev_daily_ema(conn, pair, day_start_ms)
+
         # 2) Fenêtre 15m de la session pour ce jour
         s, e = window_for_session(session, d)
 
         # Si un trade précédent est encore "ouvert" au début de cette fenêtre, on saute ce jour
-        if block_until_ts is not None and s <= block_until_ts:
-            continue
+        #if block_until_ts is not None and s <= block_until_ts:
+            #continue
 
-        # 1) Range H1 du jour (00:00–01:00 UTC)
+        # 3) Range H1 du jour (00:00–01:00 UTC)
         c1 = read_first_1h(conn, pair, d)
         if not c1:
             continue
@@ -449,19 +493,20 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
         if not c15:
             continue
 
-        # 3) Détecte le PREMIER trade dans la fenêtre (un seul par jour)
-        tr = detect_first_trade_for_day(c15, rh, rl)
+        # 4) Détecte le PREMIER trade dans la fenêtre (un seul par jour)
+        # On passe ema_val pour filtrer
+        tr = detect_first_trade_for_day(c15, rh, rl, ema_val)
         if not tr:
             continue
 
-        # 4) Enregistre les hits pour calculer R/TP% ET récupérer le closed_ts
+        # 5) Enregistre les hits pour calculer R/TP% ET récupérer le closed_ts
         _, _, hits, closed_ts = evaluate_trade_after_entry(conn, pair, tr)
         trades.append(BareTrade(hits=hits, entry_ts=tr.entry_ts))
 
-        # 5) Cross-day blocking: BLOQUE jusqu'à SL ou RR5
-        block_until_ts = closed_ts if closed_ts is not None else (2**62)
+        # 6) Cross-day blocking: BLOQUE jusqu'à SL ou RR5
+        #block_until_ts = closed_ts if closed_ts is not None else (2**62)
 
-        # 6) Passe au jour suivant (jamais de 2e trade ce jour)
+        # 7) Passe au jour suivant (jamais de 2e trade ce jour)
         continue
 
     return trades
@@ -490,12 +535,13 @@ def stats_for_weights(trades: List[BareTrade],
     if total == 0:
         return {
             "trades": 0, "winrate": 0.0,
+            "profit_factor": 0.0,
             "avg_win": 0.0, "avg_loss": 0.0, "exp": 0.0,
             "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0, "p5": 0.0
         }
 
     r_wins: List[float] = []
-    r_losses_abs: List[float] = []
+    r_losses: List[float] = [] # Contient les valeurs R négatives
 
     tp1_cnt = tp2_cnt = tp3_cnt = tp4_cnt = tp5_cnt = 0
 
@@ -513,26 +559,43 @@ def stats_for_weights(trades: List[BareTrade],
         if reached_before(hits, "RR1"):
             r_wins.append(r_mult)
         else:
-            r_losses_abs.append(-r_mult)
+            r_losses.append(r_mult)
 
     wins = len(r_wins)
-    losses = len(r_losses_abs)
-    winrate = (wins / total) if total > 0 else 0.0
-    avg_win = (sum(r_wins)/wins) if wins > 0 else 0.0
-    avg_loss = (sum(r_losses_abs)/losses) if losses > 0 else 0.0
-    expectancy = winrate * avg_win - (1.0 - winrate) * avg_loss
-
-    p1 = tp1_cnt / total
-    p2 = tp2_cnt / total
-    p3 = tp3_cnt / total
-    p4 = tp4_cnt / total
-    p5 = tp5_cnt / total
+    losses = len(r_losses)
+    total_trades = total 
+    
+    # 1. Calcul des moyennes
+    avg_win = (sum(r_wins) / wins) if wins > 0 else 0.0
+    
+    # La somme des pertes brutes est l'opposé de la somme des r_losses (qui sont des valeurs négatives)
+    total_r_losses_gross = abs(sum(r_losses)) 
+    avg_loss_r = (total_r_losses_gross / losses) if losses > 0 else 0.0
+    
+    winrate = (wins / total_trades) if total_trades > 0 else 0.0
+    expectancy = winrate * avg_win - (1.0 - winrate) * avg_loss_r
+    
+    # 2. CALCUL DU PROFIT FACTOR (PF)
+    total_r_gains_gross = sum(r_wins)
+    
+    if total_r_losses_gross > 1e-9: # Éviter la division par zéro
+        profit_factor = total_r_gains_gross / total_r_losses_gross
+    else:
+        profit_factor = 999.0 if total_r_gains_gross > 0 else 0.0 # PF très élevé si zéro perte
+    
+    # 3. Finalisation des pourcentages
+    p1 = tp1_cnt / total_trades
+    p2 = tp2_cnt / total_trades
+    p3 = tp3_cnt / total_trades
+    p4 = tp4_cnt / total_trades
+    p5 = tp5_cnt / total_trades
 
     return {
-        "trades": total,
+        "trades": total_trades,
         "winrate": winrate,
+        "profit_factor": profit_factor, 
         "avg_win": avg_win,
-        "avg_loss": avg_loss,
+        "avg_loss": avg_loss_r,
         "exp": expectancy,
         "p1": p1, "p2": p2, "p3": p3, "p4": p4, "p5": p5
     }
@@ -551,7 +614,7 @@ def build_breakdown_rows_for_pair(pair: str, session: str, trades: List[BareTrad
         hits = bt.hits
         # jour d'entrée du trade (UTC)
         dt = datetime.fromtimestamp(bt.entry_ts / 1000, tz=UTC)
-        dow_idx = dt.weekday()          # 0=MON, 6=SUN
+        dow_idx = dt.weekday()            # 0=MON, 6=SUN
         dow_name = WEEKDAYS[dow_idx]
 
         t_sl = hits.get("SL")
@@ -647,9 +710,10 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
 
     if PrettyTable:
         t = PrettyTable()
+        # AJOUT DE "PF" aux noms de colonnes
         t.field_names = [
             "Pair","Session","w1","w2","w3","w4","w5",
-            "Trades","Winrate","AvgWinR","AvgLossR","ExpectancyR",
+            "Trades","Winrate", "PF", "AvgWinR","AvgLossR","ExpectancyR",
             "TP1%","TP2%","TP3%","TP4%","TP5%"
         ]
         for r in rows_sorted:
@@ -659,6 +723,7 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
                 f"{r['w1']:.1f}", f"{r['w2']:.1f}", f"{r['w3']:.1f}", f"{r['w4']:.1f}", f"{r['w5']:.1f}",
                 r["trades"],
                 f"{r['winrate']*100:.2f}%",
+                f"{r['profit_factor']:.2f}", # AFFICHAGE DU PF
                 f"{r['avg_win']:.3f}R",
                 f"{r['avg_loss']:.3f}R",
                 f"{r['exp']:+.3f}R",
@@ -673,13 +738,15 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
         print("==========================================================")
     else:
         # Fallback
-        print("\nPair\tSession\tw1\tw2\tw3\tw4\tw5\tTrades\tWinrate\tAvgWinR\tAvgLossR\tExpectancyR\tTP1%\tTP2%\tTP3%\tTP4%\tTP5%")
+        # AJOUT DE "PF" au header
+        print("\nPair\tSession\tw1\tw2\tw3\tw4\tw5\tTrades\tWinrate\tPF\tAvgWinR\tAvgLossR\tExpectancyR\tTP1%\tTP2%\tTP3%\tTP4%\tTP5%")
         for r in rows_sorted:
             print("\t".join([
                 r["pair"], r["session"],
                 f"{r['w1']:.1f}", f"{r['w2']:.1f}", f"{r['w3']:.1f}", f"{r['w4']:.1f}", f"{r['w5']:.1f}",
                 str(r["trades"]),
                 f"{r['winrate']*100:.2f}%",
+                f"{r['profit_factor']:.2f}", # AFFICHAGE DU PF
                 f"{r['avg_win']:.3f}",
                 f"{r['avg_loss']:.3f}",
                 f"{r['exp']:+.3f}",
@@ -718,7 +785,7 @@ def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4
         session = r["session"]
         pair    = r["pair"]
         dow     = r["dow"]
-        tp      = r["tp"]   # "TP1" ... "TP5"
+        tp      = r["tp"]    # "TP1" ... "TP5"
         exp     = r["expectancy"]
 
         if dow not in valid_days:
@@ -815,9 +882,6 @@ def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold
         print(f"{session},{pair_type},{pair},{best_tp},Y,Y,Y,Y,Y")
 
 
-
-
-
 # ---------------- Main ----------------
 def main():
     ap = argparse.ArgumentParser()
@@ -890,7 +954,7 @@ def main():
                 best_rows.append({
                     "pair": pair, "session": "-",
                     "w1": 0.0, "w2": 0.0, "w3": 0.0, "w4": 0.0, "w5": 1.0,
-                    "trades": 0, "winrate": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "exp": 0.0,
+                    "trades": 0, "winrate": 0.0, "profit_factor": 0.0, "avg_win": 0.0, "avg_loss": 0.0, "exp": 0.0,
                     "p1": 0.0, "p2": 0.0, "p3": 0.0, "p4": 0.0, "p5": 0.0
                 })
 

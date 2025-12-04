@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 # mt5_bulk_fetch_to_pg.py
 """
-MT5 -> Postgres ingestor (fixed server offset UTC+3) + EMA-50 on insert:
-- Inserts all *closed* candles <= cap (if provided) and stores their OPEN UTC in ts/ts_utc.
-- Per-candle conversion (FIXED): ts_utc_ms = bar_open_server_ms - (FIXED_OFFSET_H * 3600 * 1000).
-- GAPLESS: OPEN forced to previous CLOSE if available.
-- Iterates pairs.txt (CSV with 'pair' column) and timeframes.txt (list).
-- --to optional: ISO8601 (…Z) or epoch ms. Without --to: cap = last closed bar "now" on server.
-- Adds/maintains ema_50 (NUMERIC) computed during ingestion (EMA(50) with SMA seed).
-- NEW: --pairs allows overriding pairs.txt with a space- or comma-separated list.
-
-Change log (this version):
-- Drop all DST logic. We use a manual, fixed offset (default +3 hours).
-- All server<->UTC conversions use this fixed offset only.
+MT5 -> Postgres ingestor (Dynamic UTC+2/UTC+3 offset) + EMA-50/EMA-200 on insert:
+- Inserts all *closed* candles <= cap.
+- DST Logic: Dynamically determines server offset (+2h or +3h) based on European DST rules.
+- Adds/maintains ema_50 AND ema_200 computed during ingestion.
+- GAPLESS and Resume logic are maintained.
 """
 
 import os, re, csv, sys, time
@@ -34,13 +27,18 @@ UTC = timezone.utc
 
 BATCH_BARS = 10000
 
-EMA_LEN = 50
-EMA_ALPHA = Decimal("2") / Decimal(str(EMA_LEN + 1))  # 2/(N+1)
+# EMA 50
+EMA_LEN_50 = 50
+EMA_ALPHA_50 = Decimal("2") / Decimal(str(EMA_LEN_50 + 1))
+
+# EMA 200
+EMA_LEN_200 = 200
+EMA_ALPHA_200 = Decimal("2") / Decimal(str(EMA_LEN_200 + 1))
 
 TF_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
     "1h": 3_600_000, "2h": 7_200_000, "4h": 14_400_000, "6h": 21_600_000,
-    "8h": 28_800_000, "12h": 43_200_000, "1d": 86_400_000, "1w": 604_800_000,
+    "8h": 28_800_000, "12h": 43_200_100, "1d": 86_400_000, "1w": 604_800_000,
 }
 TF_MT5 = {
     "1m": mt5.TIMEFRAME_M1, "3m": mt5.TIMEFRAME_M3, "5m": mt5.TIMEFRAME_M5,
@@ -49,6 +47,65 @@ TF_MT5 = {
     "8h": mt5.TIMEFRAME_H8, "12h": mt5.TIMEFRAME_H12,
     "1d": mt5.TIMEFRAME_D1, "1w": mt5.TIMEFRAME_W1,
 }
+
+# -------------------
+# DST Logic Helpers (European Rules)
+# -------------------
+
+def get_last_sunday(year: int, month: int) -> datetime:
+    """Trouve le dernier dimanche du mois donné (à 00:00:00 UTC)."""
+    d = datetime(year, month, 1, tzinfo=UTC) + timedelta(days=31)
+    # Assurez-vous d'être dans le bon mois
+    if d.month != month: d -= timedelta(days=d.day)
+    
+    # Recule jusqu'au dernier dimanche
+    while d.weekday() != 6: # 6 est Dimanche
+        d -= timedelta(days=1)
+    return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def get_server_offset_hours(utc_ms: int) -> int:
+    """
+    Détermine l'offset du serveur MT5 (+2 ou +3 heures) en fonction de la date
+    (règles DST de l'Union Européenne).
+    La transition UTC se fait à 1h00 UTC.
+    """
+    dt_utc = datetime.fromtimestamp(utc_ms / 1000, tz=UTC)
+    year = dt_utc.year
+    
+    # Transition DST : Last Sunday of March at 1:00 UTC
+    dst_start_utc = get_last_sunday(year, 3) + timedelta(hours=1)
+    
+    # Transition heure d'hiver : Last Sunday of October at 1:00 UTC
+    dst_end_utc = get_last_sunday(year, 10) + timedelta(hours=1)
+    
+    # Si la date est entre le début (mars) et la fin (octobre) de la DST
+    # -> C'est l'heure d'été (UTC+3)
+    if dst_start_utc <= dt_utc < dst_end_utc:
+        return 3 # Heure d'été (CEST)
+    
+    # Sinon (avant mars, ou après octobre)
+    # -> C'est l'heure d'hiver (UTC+2)
+    return 2 # Heure d'hiver (CET)
+
+# -------------------
+# Fixed offset helpers (REMPLACÉS PAR L'OFFSET DYNAMIQUE)
+# -------------------
+def utc_ms_to_server_ms(utc_ms: int) -> int:
+    """UTC -> SERVER (utilise l'offset dynamique)."""
+    fixed_hours = get_server_offset_hours(utc_ms)
+    return utc_ms + fixed_hours * 3600 * 1000
+
+def server_ms_to_utc_ms(server_ms: int) -> int:
+    """SERVER -> UTC (utilise l'offset dynamique)."""
+    # Pour convertir du serveur à UTC, on doit connaître l'offset au moment de la bougie.
+    # On fait une approximation en utilisant l'offset de l'heure UTC estimée.
+    # L'heure UTC estimée est server_ms - 2h (l'offset minimum).
+    # On recalcule l'offset précis sur cette heure UTC estimée.
+    # Cela gère le cas des bougies d'heure d'été/hiver qui ont des offsets différents.
+    approx_utc_ms = server_ms - 2 * 3600 * 1000 
+    fixed_hours = get_server_offset_hours(approx_utc_ms)
+    return server_ms - fixed_hours * 3600 * 1000
 
 # -------------------
 # Generic helpers
@@ -78,24 +135,38 @@ def get_pg_engine():
     engine = create_engine(uri, pool_pre_ping=True, future=True)
     return engine
 
-def ensure_ema_column(engine, table_name: str, scale: int):
-    """Ensure ema_50 column exists."""
-    sql = text(f'ALTER TABLE IF EXISTS "{table_name}" ADD COLUMN IF NOT EXISTS ema_50 NUMERIC(20,{scale});')
+def ensure_ema_column(engine, table_name: str, scale: int, ema_length: int):
+    """Ensure a specific EMA column exists."""
+    column_name = f"ema_{ema_length}"
+    sql = text(f'ALTER TABLE IF EXISTS "{table_name}" ADD COLUMN IF NOT EXISTS {column_name} NUMERIC(20,{scale});')
     with engine.begin() as conn:
         conn.execute(sql)
 
-def get_last_row(engine, table) -> Tuple[Optional[int], Optional[Decimal], Optional[Decimal]]:
-    """Return (last_ts, last_close, last_ema_50)."""
+def get_last_row(engine, table) -> Tuple[Optional[int], Optional[Decimal], Optional[Decimal], Optional[Decimal]]:
+    """Return (last_ts, last_close, last_ema_50, last_ema_200)."""
     with engine.connect() as c:
+        has_ema_200 = 'ema_200' in table.columns
+        
+        select_cols = [table.c.ts, table.c.close, table.c.ema_50]
+        if has_ema_200:
+            select_cols.append(table.c.ema_200)
+
         row = c.execute(
-            select(table.c.ts, table.c.close, table.c.ema_50).order_by(desc(table.c.ts)).limit(1)
+            select(*select_cols).order_by(desc(table.c.ts)).limit(1)
         ).fetchone()
+        
         if not row:
-            return None, None, None
+            return None, None, None, None
+            
         last_ts = int(row.ts)
         last_close = Decimal(row.close) if row.close is not None else None
-        last_ema = Decimal(row.ema_50) if getattr(row, "ema_50", None) is not None else None
-        return last_ts, last_close, last_ema
+        
+        last_ema_50 = Decimal(row.ema_50) if getattr(row, "ema_50", None) is not None and row.ema_50 is not None else None
+        last_ema_200 = None
+        if has_ema_200:
+             last_ema_200 = Decimal(row.ema_200) if getattr(row, "ema_200", None) is not None and row.ema_200 is not None else None
+
+        return last_ts, last_close, last_ema_50, last_ema_200
 
 def fetch_recent_closes(engine, table, n: int, before_ts: Optional[int]) -> List[Decimal]:
     """Fetch up to n closes BEFORE before_ts (exclusive) ordered ASC."""
@@ -121,14 +192,7 @@ def parse_pairs(path: str) -> List[str]:
     return pairs
 
 def parse_pairs_cli(s: str) -> List[str]:
-    """
-    Parse --pairs argument: accepts space- or comma-separated list.
-    Examples:
-      --pairs "EURUSD GBPUSD USDJPY"
-      --pairs "EURUSD,GBPUSD,USDJPY"
-    """
     toks = [t.strip() for t in re.split(r"[,\s]+", s.strip()) if t.strip()]
-    # Basic sanity filter: 6+ letters (handles metals too, e.g., XAUUSD)
     return [t for t in toks if len(t) >= 6]
 
 def parse_timeframes(path: str) -> List[str]:
@@ -153,25 +217,6 @@ def compute_initial_start_utc(tf: str) -> datetime:
     return datetime.now(UTC) - timedelta(days=days)
 
 # -------------------
-# Fixed offset helpers (UTC+3)
-# -------------------
-def fixed_server_offset_hours() -> int:
-    """
-    Returns the fixed server offset in hours.
-    Default: 3 (UTC+3). Can be overridden by CLI or env.
-    """
-    # This function is here for clarity; the actual value comes from CLI args.
-    return 3
-
-def utc_ms_to_server_ms(utc_ms: int, fixed_hours: int) -> int:
-    """UTC -> SERVER (apply fixed offset)."""
-    return utc_ms + fixed_hours * 3600 * 1000
-
-def server_ms_to_utc_ms(server_ms: int, fixed_hours: int) -> int:
-    """SERVER -> UTC (remove fixed offset)."""
-    return server_ms - fixed_hours * 3600 * 1000
-
-# -------------------
 # --to parsing
 # -------------------
 def parse_to_ms(to_arg: Optional[str]) -> Optional[int]:
@@ -190,12 +235,12 @@ def parse_to_ms(to_arg: Optional[str]) -> Optional[int]:
 # -------------------
 # MT5
 # -------------------
-def mt5_now_server_ms_frozen(fixed_hours: int) -> int:
+def mt5_now_server_ms_frozen() -> int:
     """
-    Freeze 'now' on SERVER once per run cycle using a fixed offset.
+    Freeze 'now' on SERVER once per run cycle using the calculated offset.
     """
     utc_now_ms = int(time.time() * 1000)
-    return utc_ms_to_server_ms(utc_now_ms, fixed_hours)
+    return utc_ms_to_server_ms(utc_now_ms)
 
 def copy_rates_chunk(symbol: str, tf: str, start_naive, end_naive):
     data = mt5.copy_rates_range(symbol, TF_MT5[tf], start_naive, end_naive)
@@ -206,8 +251,7 @@ def copy_rates_chunk(symbol: str, tf: str, start_naive, end_naive):
 # -------------------
 # Core
 # -------------------
-def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
-                    fixed_hours: int, now_server_ms_fixed: int):
+def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int], now_server_ms_fixed: int):
     base, quote = pair[:3], pair[3:]
     sym = None
     for cand in [pair, pair + ".a", pair + ".i", pair + ".pro", pair + ".ecn"]:
@@ -222,10 +266,11 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
     meta = MetaData()
     scale = price_scale(base, quote)
     table_name = f"candles_mt5_{sanitize_name(pair)}_{sanitize_name(tf)}"
+    
     table = Table(
         table_name, meta,
-        Column("ts", BigInteger, primary_key=True),  # OPEN UTC (ms)
-        Column("ts_utc", String),                    # ISO-UTC
+        Column("ts", BigInteger, primary_key=True),
+        Column("ts_utc", String),
         Column("open", Numeric(20, scale)),
         Column("high", Numeric(20, scale)),
         Column("low",  Numeric(20, scale)),
@@ -236,39 +281,41 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
         Column("base", String(8)),
         Column("quote", String(8)),
         Column("timeframe", String(8)),
-        Column("ema_50", Numeric(20, scale)),        # EMA on insert
+        Column("ema_50", Numeric(20, scale)),
+        Column("ema_200", Numeric(20, scale)),
     )
     meta.create_all(engine, checkfirst=True)
-    ensure_ema_column(engine, table_name, scale)
+    
+    ensure_ema_column(engine, table_name, scale, ema_length=EMA_LEN_50)
+    ensure_ema_column(engine, table_name, scale, ema_length=EMA_LEN_200)
 
-    # resume state
-    last_ts, last_close, last_ema = get_last_row(engine, table)
+    last_ts, last_close, last_ema_50, last_ema_200 = get_last_row(engine, table)
 
-    # Start point: UTC -> server-naive with fixed offset so we don't miss early bars
+    # Start point: UTC -> server-naive using offset for the START date
     if last_ts:
         start_utc = datetime.fromtimestamp((last_ts + 1) / 1000, tz=UTC)
         resume_mode = True
     else:
         start_utc = compute_initial_start_utc(tf)
         resume_mode = False
+    
+    # CALCUL DYNAMIQUE DE L'OFFSET pour le point de départ
+    start_utc_ms = int(start_utc.timestamp() * 1000)
+    initial_offset_hours = get_server_offset_hours(start_utc_ms)
+    start_server_naive = (start_utc + timedelta(hours=initial_offset_hours)).replace(tzinfo=None)
 
-    start_server_naive = (start_utc + timedelta(hours=fixed_hours)).replace(tzinfo=None)
-
-    # ---- CAP: last OPEN of a CLOSED bar at min(NOW_SERVER, --to_SERVER) ----
+    # ---- CAP ----
     tf_ms = TF_MS[tf]
-
-    # cap "now" frozen
     cap_server_ms_now = (now_server_ms_fixed // tf_ms) * tf_ms - tf_ms
 
-    # cap "--to" if provided (UTC -> server)
     if user_to_ms is not None:
-        to_server_ms = utc_ms_to_server_ms(user_to_ms, fixed_hours)
+        # CONVERSION DYNAMIQUE DE --to (UTC -> server)
+        to_server_ms = utc_ms_to_server_ms(user_to_ms)
         cap_server_ms_to = (to_server_ms // tf_ms) * tf_ms - tf_ms
         last_closed_open_ms_cap = min(cap_server_ms_now, cap_server_ms_to)
     else:
         last_closed_open_ms_cap = cap_server_ms_now
 
-    # MT5 end window: cap +1s (to not miss bar exactly at cap)
     end_server_naive = datetime.fromtimestamp(last_closed_open_ms_cap / 1000).replace(tzinfo=None) + timedelta(seconds=1)
 
     if start_server_naive >= end_server_naive:
@@ -276,21 +323,29 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
         print(f"[INFO] {pair} {tf}: no new closed bars. (start={start_utc.isoformat()} resume={resume_mode}{cap_info})")
         return
 
-    # --- EMA state ---
-    ema_prev: Optional[Decimal] = None
-    seed_buffer: List[Decimal] = []
-
-    if last_ema is not None:
-        ema_prev = Decimal(last_ema)
+    # --- EMA state INITIALISATION ---
+    ema_prev_50: Optional[Decimal] = None
+    seed_buffer_50: List[Decimal] = []
+    if last_ema_50 is not None:
+        ema_prev_50 = Decimal(last_ema_50)
     else:
-        pre_closes = fetch_recent_closes(engine, table, EMA_LEN - 1, before_ts=(last_ts + 1) if last_ts else None)
-        seed_buffer.extend(pre_closes)
+        pre_closes_50 = fetch_recent_closes(engine, table, EMA_LEN_50 - 1, before_ts=(last_ts + 1) if last_ts else None)
+        seed_buffer_50.extend(pre_closes_50)
+
+    ema_prev_200: Optional[Decimal] = None
+    seed_buffer_200: List[Decimal] = []
+    if last_ema_200 is not None:
+        ema_prev_200 = Decimal(last_ema_200)
+    else:
+        pre_closes_200 = fetch_recent_closes(engine, table, EMA_LEN_200 - 1, before_ts=(last_ts + 1) if last_ts else None)
+        seed_buffer_200.extend(pre_closes_200)
+
 
     inserted_total = 0
     current_start = start_server_naive
 
     with engine.begin() as conn:
-        prev_close = last_close  # Decimal or None
+        prev_close = last_close
         while current_start < end_server_naive:
             window_end = current_start + timedelta(milliseconds=tf_ms * BATCH_BARS)
             if window_end > end_server_naive:
@@ -302,18 +357,14 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
                 for r in rates:
                     bar_open_server_ms = int(r["time"]) * 1000
 
-                    # Do not exceed last CLOSED OPEN at cap
                     if bar_open_server_ms > last_closed_open_ms_cap:
                         continue
 
-                    # Fixed offset: server -> UTC
-                    ts_utc_ms = server_ms_to_utc_ms(bar_open_server_ms, fixed_hours)
+                    # CALCUL DYNAMIQUE DE L'OFFSET (server -> UTC)
+                    ts_utc_ms = server_ms_to_utc_ms(bar_open_server_ms)
 
-                    # Safety: if user_to is provided, do not exceed it (UTC)
                     if user_to_ms is not None and ts_utc_ms > user_to_ms:
                         continue
-
-                    # Resume
                     if last_ts and ts_utc_ms <= last_ts:
                         continue
 
@@ -327,22 +378,35 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
                     c = mt5_c
                     h = max(o, c, mt5_h)
                     l = min(o, c, mt5_l)
-
-                    v = float(r["tick_volume"])  # FX: tick volume only
+                    v = float(r["tick_volume"])
 
                     # --- EMA(50) computation ---
-                    ema_val: Optional[Decimal] = None
-                    if ema_prev is not None:
-                        ema_val = qround(EMA_ALPHA * c + (Decimal(1) - EMA_ALPHA) * ema_prev, scale)
-                        ema_prev = ema_val
+                    ema_50_val: Optional[Decimal] = None
+                    if ema_prev_50 is not None:
+                        ema_50_val = qround(EMA_ALPHA_50 * c + (Decimal(1) - EMA_ALPHA_50) * ema_prev_50, scale)
+                        ema_prev_50 = ema_50_val
                     else:
-                        seed_buffer.append(c)
-                        if len(seed_buffer) == EMA_LEN:
-                            sma = qround(sum(seed_buffer) / Decimal(EMA_LEN), scale)
-                            ema_prev = sma
-                            ema_val = sma
+                        seed_buffer_50.append(c)
+                        if len(seed_buffer_50) == EMA_LEN_50:
+                            sma = qround(sum(seed_buffer_50) / Decimal(EMA_LEN_50), scale)
+                            ema_prev_50 = sma
+                            ema_50_val = sma
                         else:
-                            ema_val = None  # seeding in progress
+                            ema_50_val = None
+
+                    # --- EMA(200) computation ---
+                    ema_200_val: Optional[Decimal] = None
+                    if ema_prev_200 is not None:
+                        ema_200_val = qround(EMA_ALPHA_200 * c + (Decimal(1) - EMA_ALPHA_200) * ema_prev_200, scale)
+                        ema_prev_200 = ema_200_val
+                    else:
+                        seed_buffer_200.append(c)
+                        if len(seed_buffer_200) == EMA_LEN_200:
+                            sma = qround(sum(seed_buffer_200) / Decimal(EMA_LEN_200), scale)
+                            ema_prev_200 = sma
+                            ema_200_val = sma
+                        else:
+                            ema_200_val = None
 
                     rows.append({
                         "ts": ts_utc_ms,
@@ -350,11 +414,12 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
                         "open": o, "high": h, "low": l, "close": c, "volume": v,
                         "exchange": "mt5", "symbol": sym,
                         "base": base, "quote": quote, "timeframe": tf,
-                        "ema_50": ema_val
+                        "ema_50": ema_50_val,
+                        "ema_200": ema_200_val
                     })
 
                     prev_close = c
-                    last_ts = ts_utc_ms  # advance cursor
+                    last_ts = ts_utc_ms
 
                 if rows:
                     res = conn.execute(
@@ -377,9 +442,6 @@ def fetch_and_store(engine, pair: str, tf: str, user_to_ms: Optional[int],
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--to", help="Optional cap: ISO8601 UTC like 2025-01-01T00:00:00Z or epoch ms", default=None)
-    # FIXED offset only (default +3 hours)
-    ap.add_argument("--server-offset-hours", type=int, default=int(os.getenv("SERVER_OFFSET_HOURS", "3")),
-                    help="Fixed server offset hours (e.g., 3 for UTC+3).")
     ap.add_argument("--pairs-file", default=os.getenv("PAIRS_FILE", "pairs.txt"),
                     help="Path to pairs file (CSV with column 'pair').")
     ap.add_argument("--timeframes-file", default=os.getenv("TIMEFRAMES_FILE", "timeframes.txt"),
@@ -389,7 +451,6 @@ def main():
     args = ap.parse_args()
 
     user_to_ms = parse_to_ms(args.to)
-    fixed_hours = int(args.server_offset_hours)
 
     if not mt5.initialize():
         print("[ERR] MT5 init failed", mt5.last_error())
@@ -418,21 +479,23 @@ def main():
         mt5.shutdown()
         sys.exit(3)
 
-    print("[INIT] Live ingestion loop (every 15s) — FIXED server offset = +%dh]" % fixed_hours)
+    print("[INIT] Live ingestion loop (every 5s) — DYNAMIC server offset (+2h / +3h)]", flush=True)
 
     try:
         while True:
-            # Recompute the frozen "now on server" EACH iteration (fixed offset)
-            now_server_ms_fixed = mt5_now_server_ms_frozen(fixed_hours=fixed_hours)
+            # Recompute the frozen "now on server" EACH iteration (dynamic offset)
+            now_server_ms_fixed = mt5_now_server_ms_frozen()
+            
+            # Affichage de l'offset actuel
+            current_offset = get_server_offset_hours(int(time.time() * 1000))
             dt_now_srv = datetime.fromtimestamp(now_server_ms_fixed/1000, tz=UTC).isoformat(timespec="seconds")
-            print(f"[LOOP] Server-now≈ {dt_now_srv}  (offset=+{fixed_hours}h)", flush=True)
+            print(f"[LOOP] Server-now≈ {dt_now_srv}  (offset=+{current_offset}h)", flush=True)
 
             for pair in pairs:
                 for tf in tfs:
                     fetch_and_store(
                         engine, pair, tf,
                         user_to_ms=user_to_ms,
-                        fixed_hours=fixed_hours,
                         now_server_ms_fixed=now_server_ms_fixed
                     )
             time.sleep(5)
