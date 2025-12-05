@@ -23,6 +23,8 @@ Entrées & cibles :
 - R-multiple: application événementielle des partiels (w1..w5), w1+...+w5=1.
 
 *** AJOUT DU FILTRE EMA 200 DAILY (Lecture DB) : LONG si entrée > EMA, SHORT si entrée < EMA. ***
+
+*** MISE À JOUR : Le breakdown quotidien applique maintenant le filtre (ExpR >= 0.15 ET PF >= 1.5) ***
 """
 
 import os, sys, argparse, csv
@@ -41,7 +43,6 @@ WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 LONDON_TZ = ZoneInfo("Europe/London")
 
 # --- CONFIG NOM COLONNE DB ---
-# Assurez-vous que votre table _d1 contient bien cette colonne
 EMA_COL_NAME = "ema_200"
 
 # ---------------- ENV / DB ----------------
@@ -165,10 +166,10 @@ def infer_type(pair: str) -> str:
 def read_prev_daily_ema(conn, pair: str, current_day_start_ms: int) -> Optional[float]:
     """
     Récupère l'EMA 200 Daily directement depuis la DB.
-    On prend la dernière bougie D1 qui a un TS < au début de la journée actuelle.
-    Cela correspond à l'EMA de la veille (clôturée), pour éviter le look-ahead bias.
+    ATTENTION: Utilise le TF '1d'.
     """
-    t_d1 = table_name(pair, "1d")
+    t_d1 = table_name(pair, "1d") 
+    
     # On cherche la dernière bougie close avant le début de cette journée
     sql = f"SELECT {EMA_COL_NAME} FROM {t_d1} WHERE ts < %s ORDER BY ts DESC LIMIT 1"
     
@@ -180,9 +181,6 @@ def read_prev_daily_ema(conn, pair: str, current_day_start_ms: int) -> Optional[
                 return float(row[0])
             return None
     except Exception:
-        # Si la colonne n'existe pas ou erreur SQL, on ignore (ou on log)
-        # conn.rollback() est important ici si on est dans une transaction, 
-        # mais ici on est en autocommit. Par sécurité :
         conn.rollback() 
         return None
 
@@ -284,14 +282,7 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
                 entry_price = prev_hh
                 
                 # --- FILTRE EMA LONG ---
-                # Si EMA existe et Entry <= EMA, on rejette (on veut Entry > EMA)
                 if ema_daily is not None and entry_price <= ema_daily:
-                    # Filtre échoué, on ne prend pas le trade.
-                    # Note : on continue la boucle ou on reset ?
-                    # La règle est "AU PLUS 1 trade". Si le signal est là mais filtré, 
-                    # techniquement on a eu le signal. Ici on retourne None = pas de trade pris ce tick.
-                    # Mais comme la fonction cherche "le premier", si on ne le retourne pas ici,
-                    # la boucle continue. Si un autre setup se présente plus tard et passe l'EMA, il sera pris.
                     pass 
                 else:
                     sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
@@ -315,7 +306,6 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
                 entry_price = prev_ll
 
                 # --- FILTRE EMA SHORT ---
-                # Si EMA existe et Entry >= EMA, on rejette (on veut Entry < EMA)
                 if ema_daily is not None and entry_price >= ema_daily:
                     pass
                 else:
@@ -472,7 +462,6 @@ def collect_trades_for_session(conn, pair: str, start: date, end: date, session:
 
     for d in daterange(start, end):
         # 1) Fetch D1 EMA (200) depuis la DB pour ce jour
-        # On passe le start_ms du jour pour trouver l'EMA précédente
         day_start_ms, _ = day_ms_bounds(d)
         ema_val = read_prev_daily_ema(conn, pair, day_start_ms)
 
@@ -603,56 +592,60 @@ def stats_for_weights(trades: List[BareTrade],
 # ---------------- Breakdown Pair / Jour / TP (TP unique) ----------------
 def build_breakdown_rows_for_pair(pair: str, session: str, trades: List[BareTrade]) -> List[Dict[str, Any]]:
     """
-    Breakdown par paire / jour de la semaine / TP :
-    - On considère un TP UNIQUE (TP1, TP2, TP3, TP4 ou TP5).
-    - R-multiple simple : +k R si TPk avant SL, sinon -1 R.
-      (k = 1..5 pour TP1..TP5)
+    Modifié pour calculer ExpR et PF pour chaque combinaison Jour/TP.
     """
-    buckets = defaultdict(lambda: {"trades": 0, "wins": 0, "sum_r": 0.0})
+    # Structure mise à jour pour le calcul du PF
+    buckets = defaultdict(lambda: {"trades": 0, "wins": 0, "r_wins_sum": 0.0, "r_losses_sum_abs": 0.0})
 
     for bt in trades:
         hits = bt.hits
-        # jour d'entrée du trade (UTC)
         dt = datetime.fromtimestamp(bt.entry_ts / 1000, tz=UTC)
         dow_idx = dt.weekday()            # 0=MON, 6=SUN
         dow_name = WEEKDAYS[dow_idx]
 
         t_sl = hits.get("SL")
 
-        # On évalue le trade comme s'il utilisait un TP unique
+        # Évaluation du trade comme s'il utilisait un TP unique
         for tp_key, k, tp_label in [
-            ("RR1", 1, "TP1"),
-            ("RR2", 2, "TP2"),
-            ("RR3", 3, "TP3"),
-            ("RR4", 4, "TP4"),
-            ("RR5", 5, "TP5"),
+            ("RR1", 1, "TP1"), ("RR2", 2, "TP2"), ("RR3", 3, "TP3"),
+            ("RR4", 4, "TP4"), ("RR5", 5, "TP5"),
         ]:
             bucket_key = (dow_name, tp_label)
             buckets[bucket_key]["trades"] += 1
-
+            r = float(k)
+            
             t_tp = hits.get(tp_key)
             if (t_tp is not None) and (t_sl is None or t_tp < t_sl):
-                r = float(k)  # TPk atteint avant SL
+                # WIN
                 buckets[bucket_key]["wins"] += 1
+                buckets[bucket_key]["r_wins_sum"] += r
             else:
-                r = -1.0      # SL avant (ou TP jamais atteint)
-
-            buckets[bucket_key]["sum_r"] += r
+                # LOSS (-1.0 R)
+                r = -1.0
+                buckets[bucket_key]["r_losses_sum_abs"] += abs(r)
 
     rows: List[Dict[str, Any]] = []
 
-    # Tri par jour puis TP
     def sort_key(item):
         (dow_name, tp_label) = item[0]
         return (WEEKDAYS.index(dow_name), tp_label)
 
     for (dow_name, tp_label), agg in sorted(buckets.items(), key=sort_key):
         total = agg["trades"]
-        if total == 0:
-            continue
+        if total == 0: continue
         wins = agg["wins"]
+        
+        # Calcul des métriques
+        total_r_gains_gross = agg["r_wins_sum"]
+        total_r_losses_gross = agg["r_losses_sum_abs"]
+        
         winrate = wins / total
-        avg_r = agg["sum_r"] / total  # expectancy R moyen avec ce TP unique
+        avg_r = (total_r_gains_gross - total_r_losses_gross) / total # Expectancy R
+
+        if total_r_losses_gross > 1e-9:
+            profit_factor = total_r_gains_gross / total_r_losses_gross
+        else:
+            profit_factor = 999.0 if total_r_gains_gross > 0 else 0.0
 
         rows.append({
             "pair": pair,
@@ -662,6 +655,7 @@ def build_breakdown_rows_for_pair(pair: str, session: str, trades: List[BareTrad
             "trades": total,
             "winrate": winrate,
             "expectancy": avg_r,
+            "profit_factor": profit_factor
         })
 
     return rows
@@ -710,7 +704,6 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
 
     if PrettyTable:
         t = PrettyTable()
-        # AJOUT DE "PF" aux noms de colonnes
         t.field_names = [
             "Pair","Session","w1","w2","w3","w4","w5",
             "Trades","Winrate", "PF", "AvgWinR","AvgLossR","ExpectancyR",
@@ -738,7 +731,6 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
         print("==========================================================")
     else:
         # Fallback
-        # AJOUT DE "PF" au header
         print("\nPair\tSession\tw1\tw2\tw3\tw4\tw5\tTrades\tWinrate\tPF\tAvgWinR\tAvgLossR\tExpectancyR\tTP1%\tTP2%\tTP3%\tTP4%\tTP5%")
         for r in rows_sorted:
             print("\t".join([
@@ -758,107 +750,87 @@ def print_final_best_table(rows: List[Dict[str, Any]]):
             ]))
         print("==========================================================")
 
-# ---------------- Impression breakdown CSV Pair / Jour / TP ----------------
-def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.4):
+# ---------------- IMPRESSION CSV DÉTAILLÉ JOUR/PAIRE/TP ----------------
+def print_breakdown_table(rows: List[Dict[str, Any]], exp_threshold: float = 0.15, pf_threshold: float = 1.5):
     """
-    Affiche au format :
-
-    SESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI
-
-    Règle:
-    - Pour chaque (session, pair, jour), on choisit le TP (TP1..TP5) avec la meilleure expectancy.
-    - On met Y sur ce TP si son expectancy > exp_threshold, sinon N.
-    - Un seul TP peut être Y par jour et par paire/session.
-    - On ne garde que les lignes (session, pair, TP) avec au moins un Y.
+    Restaure la sortie CSV détaillée Jour/TP (Y/N), en filtrant par le double seuil local.
     """
     if not rows:
-        print("\nAucun trade pour le breakdown pair/jour/TP.")
+        print("\n[BREAKDOWN QUOTIDIEN] Aucune paire n'a passé le filtre global ou quotidien.")
         return
-
-    # 1) On regroupe par (session, pair, day, tp) -> expectancy
-    # structure : by_sp_day[(session, pair)][day][tp] = expectancy
-    by_sp_day: Dict[Tuple[str, str], Dict[str, Dict[str, Optional[float]]]] = {}
-
-    valid_days = ["MON", "TUE", "WED", "THU", "FRI"]
-
+    
+    # --- 1) Déterminer le meilleur TP par Jour/Paire qui passe le double filtre ---
+    # best_tp_per_spd[(session, pair, day)] = (tp_best, exp_best, pf_best)
+    best_tp_per_spd: Dict[Tuple[str, str, str], Tuple[Optional[str], Optional[float], Optional[float]]] = {}
+    
     for r in rows:
-        session = r["session"]
-        pair    = r["pair"]
-        dow     = r["dow"]
-        tp      = r["tp"]    # "TP1" ... "TP5"
-        exp     = r["expectancy"]
-
-        if dow not in valid_days:
-            continue  # on ignore le weekend dans ce CSV
-
-        key = (session, pair)
-        if key not in by_sp_day:
-            by_sp_day[key] = {d: {} for d in valid_days}
-        by_sp_day[key][dow][tp] = exp
-
-    # 2) Pour chaque (session, pair, day), déterminer le TP avec la meilleure expectancy
-    # best_tp_per_spd[(session, pair, day)] = (tp_best, exp_best) ou (None, None)
-    best_tp_per_spd: Dict[Tuple[str, str, str], Tuple[Optional[str], Optional[float]]] = {}
-
-    for (session, pair), day_map in by_sp_day.items():
-        for d in valid_days:
-            tps = day_map.get(d, {})
-            best_tp = None
-            best_exp = None
-            for tp in ["TP1", "TP2", "TP3", "TP4", "TP5"]:
-                e = tps.get(tp)
-                if e is None:
-                    continue
-                if (best_exp is None) or (e > best_exp):
-                    best_exp = e
-                    best_tp = tp
-            best_tp_per_spd[(session, pair, d)] = (best_tp, best_exp)
-
-    # 3) Construire la structure finale par (session, pair, tp) -> flags par jour
+        key_day = (r["session"], r["pair"], r["dow"])
+        
+        # Filtre local : ExpR >= seuil ET PF >= seuil
+        if r["expectancy"] >= exp_threshold and r["profit_factor"] >= pf_threshold:
+            # On utilise l'expectancy pour départager si plusieurs TP passent
+            current_best_exp = best_tp_per_spd.get(key_day, (None, -999.0, 0.0))[1]
+            
+            if r["expectancy"] > current_best_exp:
+                best_tp_per_spd[key_day] = (r["tp"], r["expectancy"], r["profit_factor"])
+    
+    # --- 2) Construction de la structure finale des drapeaux (CSV) ---
     # final_flags[(session, pair, tp)] = {day: "Y"/"N"}
     final_flags: Dict[Tuple[str, str, str], Dict[str, str]] = {}
+    valid_days = ["MON", "TUE", "WED", "THU", "FRI"]
+    
+    all_sp_keys = sorted(list({(r["session"], r["pair"]) for r in rows}))
 
-    for (session, pair, d), (tp_best, exp_best) in best_tp_per_spd.items():
+    for session, pair in all_sp_keys:
         for tp in ["TP1", "TP2", "TP3", "TP4", "TP5"]:
             key = (session, pair, tp)
-            if key not in final_flags:
-                final_flags[key] = {day: "N" for day in valid_days}
+            final_flags[key] = {day: "N" for day in valid_days}
 
-            # Si ce TP est le meilleur du jour et dépasse le seuil -> Y, sinon N (on laisse comme N)
-            if tp_best == tp and exp_best is not None and exp_best > exp_threshold:
-                final_flags[key][d] = "Y"
-
-    # 4) Impression CSV : on ne garde que les lignes avec au moins un Y
+        for d in valid_days:
+            key_day = (session, pair, d)
+            tp_best_for_day, _, _ = best_tp_per_spd.get(key_day, (None, None, None))
+            
+            if tp_best_for_day is not None:
+                # Marquer 'Y' sur le TP qui a été identifié comme le meilleur du jour
+                final_flags[(session, pair, tp_best_for_day)][d] = "Y"
+                
+    # --- 3) Impression CSV ---
     print("\nSESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
-
+    
     # tri par SESSION, PAIR, TP
+    output_lines: List[str] = []
+    
     for (session, pair, tp), day_flags in sorted(final_flags.items(), key=lambda x: (x[0][0], x[0][1], x[0][2])):
         flags_list = [day_flags[d] for d in valid_days]
         if not any(f == "Y" for f in flags_list):
-            continue  # on skip les lignes full N
+            continue 
 
         pair_type = infer_type(pair)
         line = f"{session},{pair_type},{pair},{tp}," + ",".join(flags_list)
-        print(line)
+        output_lines.append(line)
+    
+    if output_lines:
+        print('\n'.join(output_lines))
+    else:
+        # Affichage d'un message si aucun TP/Jour n'a passé le filtre local
+        print(f"\n[BREAKDOWN QUOTIDIEN] Aucun TP/Jour n'a passé le double filtre local (ExpR >= {exp_threshold} et PF >= {pf_threshold}).")
 
-def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold: float = 0.15):
+def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], 
+                             best_exp_threshold: float = 0.15, 
+                             pf_threshold: float = 1.5):
     """
-    CSV global basé sur le tableau recap (best_rows) :
-
-    - On filtre les paires dont l'expectancy globale (exp) >= best_exp_threshold.
+    Restauration du CSV des paires 'haut rendement' (Global ExpR/PF filter).
+    
+    - On filtre les paires dont l'expectancy globale (exp) >= best_exp_threshold ET PF >= pf_threshold.
     - On choisit le TP correspondant AU POIDS DOMINANT (w1..w5) de cette paire.
-      -> w1 max  => TP1
-      -> w2 max  => TP2
-      -> ...
-      -> w5 max  => TP5
     - On affiche : SESSION,TYPE,PAIR,TP,Y,Y,Y,Y,Y
     """
 
     print("\nSESSION,TYPE,PAIR,TP,MON,TUE,WED,THU,FRI")
 
     for r in best_rows:
-        # 1) Filtre sur l'ExpectancyR globale du recap
-        if r["exp"] < best_exp_threshold:
+        # 1) Filtre sur l'ExpectancyR globale du recap ET le Profit Factor
+        if r["exp"] < best_exp_threshold or r["profit_factor"] < pf_threshold:
             continue
 
         session = r["session"]
@@ -870,11 +842,8 @@ def print_high_exp_pairs_csv(best_rows: List[Dict[str, Any]], best_exp_threshold
 
         # 2) Choix du TP via le POIDS dominant w1..w5
         weights = [
-            ("TP1", r["w1"]),
-            ("TP2", r["w2"]),
-            ("TP3", r["w3"]),
-            ("TP4", r["w4"]),
-            ("TP5", r["w5"]),
+            ("TP1", r["w1"]), ("TP2", r["w2"]), ("TP3", r["w3"]),
+            ("TP4", r["w4"]), ("TP5", r["w5"]),
         ]
         best_tp, _ = max(weights, key=lambda x: x[1])  # max sur le poids
 
@@ -901,6 +870,12 @@ def main():
         type=float,
         default=0.15,
         help="Seuil d'expectancy globale (R) pour le CSV 'all days = Y' (expR >= ce seuil)."
+    )
+    ap.add_argument(
+        "--pf-threshold",
+        type=float,
+        default=1.5,
+        help="Seuil de Profit Factor (PF >= ce seuil) pour le filtrage final."
     )
     args = ap.parse_args()
 
@@ -968,11 +943,31 @@ def main():
     # 4) Affichage final (1 ligne par paire)
     print_final_best_table(best_rows)
 
-    # 5) Affichage breakdown pair / jour / TP au format CSV
-    print_breakdown_table(breakdown_rows, exp_threshold=args.exp_threshold)
+    # --- FILTRE GLOBAL DES PAIRES PERFOMANTES (Pour le breakdown) ---
+    filtered_pairs_set = {
+        r["pair"] for r in best_rows 
+        if r.get("exp", 0.0) >= args.best_exp_threshold and r.get("profit_factor", 0.0) >= args.pf_threshold
+    }
+
+    filtered_breakdown_rows = [
+        r for r in breakdown_rows
+        if r["pair"] in filtered_pairs_set
+    ]
+    # --- FIN DU FILTRE ---
+
+    # 5) Affichage des actions quotidiennes recommandées (CSV DÉTAILLÉ)
+    print_breakdown_table(
+        filtered_breakdown_rows, 
+        exp_threshold=args.best_exp_threshold,
+        pf_threshold=args.pf_threshold
+    )
     
-    # 6) Affichage CSV des paires "haut rendement" (expR globale >= seuil) avec tous les jours = Y
-    print_high_exp_pairs_csv(best_rows, best_exp_threshold=args.best_exp_threshold)
+    # 6) Affichage CSV des paires "haut rendement" (CSV SIMPLE)
+    print_high_exp_pairs_csv(
+        best_rows, 
+        best_exp_threshold=args.best_exp_threshold,
+        pf_threshold=args.pf_threshold
+    )
 
 if __name__ == "__main__":
     main()

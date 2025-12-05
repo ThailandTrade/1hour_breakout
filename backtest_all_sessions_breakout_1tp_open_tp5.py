@@ -7,9 +7,11 @@ Règles clés :
 - Fichier session_pairs.txt : lignes "SESSION,PAIR,TPx" (ex: NY,EURUSD,TP1).
 - Chaque paire a un seul objectif : TP1 ou TP2 ou TP3 ou TP4 ou TP5.
 - Outcome binaire : TP (avant SL) sinon SL.
-- R-multiple par trade : +k R si TPk atteint avant SL, sinon -1 R (k = 1..5).
+- R-multiple : +k R si TPk atteint avant SL, sinon -1 R (k = 1..5).
 - Sizing : risque % sur capital disponible (equity - risques ouverts).
 - Frais : 3.5 USD par lot par transaction (entrée et sortie).
+
+*** AJOUT DU FILTRE EMA 200 DAILY (Lecture DB) : LONG si entrée > EMA, SHORT si entrée < EMA. ***
 
 Sorties :
 - Tableau final : TP (prix) et Résultat (TP/SL) au lieu de colonnes multiples.
@@ -48,6 +50,9 @@ FEE_PER_LOT   = 2.5
 
 UTC = timezone.utc
 LONDON_TZ = ZoneInfo("Europe/London")
+
+# --- CONFIG NOM COLONNE DB ---
+EMA_COL_NAME = "ema_200"
 
 # ---------- ENV / DB ----------
 load_dotenv()
@@ -89,8 +94,8 @@ def day_ms_bounds(d: date) -> Tuple[int, int]:
 # ---------- Fenêtres de session (UTC) ----------
 def tokyo_signal_window(d: date) -> Tuple[int, int]:
     base = datetime(d.year, d.month, d.day, tzinfo=UTC)
-    debut = int((base + timedelta(hours=1)).timestamp()*1000)               # 01:00
-    fin   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)   # 05:45
+    debut = int((base + timedelta(hours=1)).timestamp()*1000)                # 01:00
+    fin   = int((base + timedelta(hours=5, minutes=45)).timestamp()*1000)    # 05:45
     return debut, fin
 
 def london_signal_window(d: date) -> Tuple[int, int]:
@@ -147,22 +152,41 @@ def pip_size_for(pair: str) -> float:
 
 def contract_size_for(pair: str) -> float:
     # XAU 1 lot = 100 oz ; FX 1 lot = 100,000 unités de base
-    return 100.0 if p.upper().startswith("XAU") else 100_000.0
-
-def contract_size_for(pair: str) -> float:
     return 100.0 if pair.upper().startswith("XAU") else 100_000.0
 
 def fmt_price(pair: str, x: float) -> str:
     if pair.upper().endswith("JPY"):
         return f"{x:.3f}"
     if pair.upper().startswith("XAU"):
-        return f"{x:.5f}"
+        return f"{x:.2f}" # xau en .2
     return f"{x:.5f}"
 
 def fmt_target(pair: str, x: float) -> str:
     return fmt_price(pair, x)
 
 # ---------- Lectures DB ----------
+
+# NOUVELLE FONCTION: Lit la EMA 200 du jour précédent
+def read_prev_daily_ema(conn, pair: str, current_day_start_ms: int) -> Optional[float]:
+    """
+    Récupère l'EMA 200 Daily directement depuis la DB pour la dernière bougie close avant ce jour.
+    """
+    t_d1 = table_name(pair, "1d") 
+    
+    # On cherche la dernière bougie close avant le début de cette journée
+    sql = f"SELECT {EMA_COL_NAME} FROM {t_d1} WHERE ts < %s ORDER BY ts DESC LIMIT 1"
+    
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (current_day_start_ms,))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+            return None
+    except Exception:
+        conn.rollback() 
+        return None
+
 def read_first_1h(conn, pair: str, d: date) -> Optional[Dict]:
     t1h = table_name(pair, "1h")
     day_start, _ = day_ms_bounds(d)
@@ -227,10 +251,6 @@ def fx_close_at(conn, pair: str, ts_ms: int) -> Optional[float]:
 def pip_value_per_lot_usd_at(conn, pair: str, entry_ts: int, entry_price: float) -> float:
     """
     USD account — USD per pip for 1 lot.
-    - xxxUSD : 10
-    - *JPY (incl. USDJPY) : 1000 / USDJPY
-    - XAUUSD : 100 * 0.01 = 1
-    - else   : 10 (fallback)
     """
     p = pair.upper()
     if p.startswith("XAU") and p.endswith("USD"):
@@ -268,17 +288,15 @@ class Trade:
 # NEW: Pending setup (break+pullback ready, no wick yet)
 @dataclass
 class PendingSetup:
-    side: str                # "LONG" | "SHORT"
-    last_ts: int             # ts de la dernière bougie considérée
-    entry_candidate: float   # HH (LONG) ou LL (SHORT) du break
-    sl_candidate: float      # min low (LONG) ou max high (SHORT) depuis pullback (bougies fermées)
+    side: str              # "LONG" | "SHORT"
+    last_ts: int           # ts de la dernière bougie considérée
+    entry_candidate: float # HH (LONG) ou LL (SHORT) du break
+    sl_candidate: float    # min low (LONG) ou max high (SHORT) depuis pullback (bougies fermées)
 
-# *** ALIGNÉ AVEC LE SCRIPT DE RÉFÉRENCE — SL = BAR i-1 ***
-def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float) -> Optional[Trade]:
+# *** MODIFIÉ POUR ACCEPTER EMA_DAILY ***
+def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: float, ema_daily: Optional[float]) -> Optional[Trade]:
     """
-    Break strict (close > high ou close < low), puis pullback antagoniste (close contraire),
-    puis wick trigger (dépassement du hh/ll du break).
-    SL = plus bas/haut MIN/MAX depuis le pullback (inclus).
+    Ajoute le filtre EMA 200.
     """
     long_active = False
     long_hh: Optional[float] = None
@@ -327,8 +345,14 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             # Wick trigger : dépasse le hh du break après le pullback
             if (prev_hh is not None) and (long_pullback_idx is not None) and (i > long_pullback_idx) and (h > prev_hh) and (i >= 1):
                 entry_price = prev_hh
-                sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
-                return Trade("LONG", ts, entry_price, sl_price)
+                
+                # --- FILTRE EMA LONG ---
+                if ema_daily is not None and entry_price <= ema_daily:
+                    # Non conforme au filtre EMA: Entry LONG (prev_hh) DOIT être > EMA
+                    pass 
+                else:
+                    sl_price = long_min_low_since_pullback if long_min_low_since_pullback is not None else c15[i-1]["low"]
+                    return Trade("LONG", ts, entry_price, sl_price)
 
             # Suivi du hh courant
             if (long_hh is None) or (h > long_hh):
@@ -355,8 +379,14 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
             # Wick trigger : casse le ll du break après le pullback
             if (prev_ll is not None) and (short_pullback_idx is not None) and (i > short_pullback_idx) and (l < prev_ll) and (i >= 1):
                 entry_price = prev_ll
-                sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
-                return Trade("SHORT", ts, entry_price, sl_price)
+                
+                # --- FILTRE EMA SHORT ---
+                if ema_daily is not None and entry_price >= ema_daily:
+                    # Non conforme au filtre EMA: Entry SHORT (prev_ll) DOIT être < EMA
+                    pass
+                else:
+                    sl_price = short_max_high_since_pullback if short_max_high_since_pullback is not None else c15[i-1]["high"]
+                    return Trade("SHORT", ts, entry_price, sl_price)
 
             # Suivi du ll courant
             if (short_ll is None) or (l < short_ll):
@@ -364,7 +394,8 @@ def detect_first_trade_for_day(c15: List[Dict], range_high: float, range_low: fl
 
     return None
 
-# NEW: Détection d'un setup en attente (break+pullback présents, pas de wick)
+# NEW: Détection d'un setup en attente (break+pullback prêts, pas de wick)
+# Note: Cette fonction est conservée pour SHOW_OPEN_SETUPS mais n'applique pas le filtre EMA ici
 def detect_pending_setup(c15: List[Dict], range_high: float, range_low: float) -> Optional[PendingSetup]:
     long_active = False
     long_hh: Optional[float] = None
@@ -605,16 +636,16 @@ def print_summary(total_trades:int, wins:int, losses:int,
     wl_str = f"{wins}/{wins+losses} = {wl_pct:.2f}%" if (wins+losses)>0 else "N/A"
     print(f"\n===== SUMMARY ({label}) =====")
     print(f"Trades (entries trouvés) : {total_trades}")
-    print(f"Winrate :                 {wl_str}")
-    print(f"Expectancy (R) :          {expectancy_R:+.3f}R")
-    print(f"Total frais :             ${total_fees:,.2f}")
-    print(f"Capital départ :          ${start_cap:,.2f}")
-    print(f"Capital final :           ${equity:,.2f}")
-    print(f"Max Drawdown :            ${mdd_abs:,.2f}  ({mdd_pct:.2f}%)")
+    print(f"Winrate :                  {wl_str}")
+    print(f"Expectancy (R) :           {expectancy_R:+.3f}R")
+    print(f"Total frais :              ${total_fees:,.2f}")
+    print(f"Capital départ :           ${start_cap:,.2f}")
+    print(f"Capital final :            ${equity:,.2f}")
+    print(f"Max Drawdown :             ${mdd_abs:,.2f} ({mdd_pct:.2f}%)")
     if worst_day:
-        print(f"Max Daily Drawdown :      ${worst_daily_abs:,.2f}  ({worst_daily_pct:,.2f}%)  le {worst_day}")
+        print(f"Max Daily Drawdown :       ${worst_daily_abs:,.2f} ({worst_daily_pct:,.2f}%) le {worst_day}")
     else:
-        print(f"Max Daily Drawdown :      ${worst_daily_abs:,.2f}  ({worst_daily_pct:,.2f}%)")
+        print(f"Max Daily Drawdown :       ${worst_daily_abs:,.2f} ({worst_daily_pct:,.2f}%)")
     print("=====================================")
 
 def print_monthly_breakdown(monthly):
@@ -676,7 +707,7 @@ class PreparedTrade:
     tp_level: str
     tr: Trade
     tp_price: float
-    outcome: str        # "TP" | "SL"
+    outcome: str         # "TP" | "SL"
     closed_ts: Optional[int]
     r_mult: float
     risk_amount: float = 0.0
@@ -699,14 +730,20 @@ def run_all(conn,
     prepared: List[PreparedTrade] = []
     seen_sessions = set()  # 1 trade max par (SESSION, PAIR, DATE)
 
-    # *** Anti-chevauchement (logique de référence) ***
-    last_close_by_key: Dict[Tuple[str, str], Optional[int]] = {}  # (session, pair) -> last_close_ts (SL ou RR5)
-
     # NEW: collecteur de setups en attente
     pending_setups_rows: List[List[Any]] = []
 
     for d in daterange(start, end):
-        wd = d.weekday()  # 0 = lundi ... 6 = dimanche
+        wd = d.weekday() # 0 = lundi ... 6 = dimanche
+        
+        # 1) Prépare EMA pour la journée
+        day_start_ms, _ = day_ms_bounds(d)
+        
+        # NOTE IMPORTANTE: Ici l'EMA est lue par PAIR
+        ema_vals = {}
+        for _, pair, _, __ in session_pairs:
+            ema_vals[pair] = read_prev_daily_ema(conn, pair, day_start_ms)
+
         for sess, pair, tp_level, allowed_by_wd in session_pairs:
             # ⛔ Ignore les jours marqués "N"
             if not allowed_by_wd.get(wd, False):
@@ -724,9 +761,10 @@ def run_all(conn,
             c15 = read_15m_in(conn, pair, s, e)
             if not c15:
                 continue
-
-            # Détection trade complet
-            tr = detect_first_trade_for_day(c15, rh, rl)
+            
+            # Détection trade complet (AVEC FILTRE EMA)
+            ema_val = ema_vals.get(pair)
+            tr = detect_first_trade_for_day(c15, rh, rl, ema_val)
             if not tr:
                 # NEW: si pas d'entrée, on essaie de détecter un setup en attente
                 if SHOW_OPEN_SETUPS:
@@ -747,12 +785,7 @@ def run_all(conn,
                         ])
                 continue
 
-            # Anti-overlap : pas d'entrée si trade précédent (même session, même paire) pas encore clôturé
-            last_key = (sess.upper(), pair.upper())
-            last_close_ts = last_close_by_key.get(last_key)
-            if last_close_ts is not None and tr.entry_ts <= last_close_ts:
-                seen_sessions.add(key)  # on consomme quand même la journée/session/paire
-                continue
+            # Anti-overlap DÉSACTIVÉ (comme demandé)
 
             # Skip si stop < min_stop_pips (et on "consomme" la session/paire/jour)
             pip_sz = pip_size_for(pair)
@@ -790,11 +823,7 @@ def run_all(conn,
                 r_mult  = -1.0
                 closed_ts_user = hits["SL"]
 
-            # Met à jour l’anti-overlap avec la clôture de RÉFÉRENCE (SL ou RR5, le premier)
-            if closed_ts_ref is not None:
-                last_close_by_key[last_key] = closed_ts_ref
-            else:
-                last_close_by_key[last_key] = last_close_by_key.get(last_key, None)
+            # L'anti-overlap n'est pas mis à jour ici car il est désactivé.
 
             pt = PreparedTrade(pair=pair, session=sess, tp_level=tp_level,
                                tr=tr, tp_price=tp_price, outcome=outcome,
@@ -806,6 +835,7 @@ def run_all(conn,
         print_summary(0, 0, 0, 0.0, start_capital, start_capital, 0.0, 0.0, 0.0, 0.0, 0.0, None, "ALL")
         return
 
+    # Suite de la fonction run_all (inchangée dans sa logique de simulation et d'affichage)
     # Évènements (entrées / sorties) pour simuler l’equity dans le temps
     from collections import defaultdict
     evmap: Dict[int, List[Tuple[str, PreparedTrade]]] = defaultdict(list)
@@ -869,7 +899,7 @@ def run_all(conn,
             if etype != "ENTRY":
                 continue
 
-            # une position max par paire en même temps
+            # une position max par paire en même temps (ceci est la règle de sizing, non l'anti-overlap)
             if any(ot.pair == pt.pair for ot in open_trades):
                 continue
 
@@ -953,14 +983,21 @@ def run_all(conn,
             monthly[mk]["pnl"]  += pnl_net
             monthly[mk]["fees"] += pt.fee_total
             if pt.outcome == "TP": monthly[mk]["wins"] += 1
-            else:                   monthly[mk]["losses"] += 1
+            else:                  monthly[mk]["losses"] += 1
 
             # Weekday bucket (based on entry_date)
+            entry_date = datetime.fromtimestamp(pt.tr.entry_ts/1000, tz=UTC).date()
             wd = entry_date.weekday()
-            wb = weekday_stats[wd]
+            
+            # *** CORRECTION: Assurer l'initialisation du jour avant l'accès ***
+            if wd not in weekday_stats:
+                 weekday_stats[wd] = {"trades":0,"wins":0,"losses":0,"pnl":0.0,"fees":0.0,"r_sum":0.0}
+            # *** Fin de la correction ***
+
+            wb = weekday_stats[wd] # L'accès est maintenant sécurisé
             wb["pnl"]  += pnl_net
             wb["fees"] += pt.fee_total
-            wb["r_sum"] += pt.r_mult
+            wb["r_sum"] += pt.r_mult # Ajouté pour être complet (comme dans l'ENTRY)
             if pt.outcome == "TP": wb["wins"] += 1
             else:                  wb["losses"] += 1
 
@@ -973,6 +1010,9 @@ def run_all(conn,
             pip_sz = pip_size_for(pt.pair)
             stop_pips = abs(pt.tr.entry - pt.tr.sl) / max(pip_sz, 1e-12)
 
+            # **********************************************
+            # CORRECTION APPLIQUÉE ICI : AJOUT DE pt.fee_total
+            # **********************************************
             row = [
                 pt.pair,
                 pt.session,
@@ -987,7 +1027,7 @@ def run_all(conn,
                 f"{pt.r_mult:+.2f}R",
                 f"{pt.lot_size:.3f}",
                 f"{pt.lev_used:.2f}x",
-                f"{pt.fee_total:.2f}",
+                f"{pt.fee_total:.2f}", # <--- NOUVELLE VALEUR POUR "Frais $"
                 f"{pnl_net:+.2f}",
                 f"{equity:,.2f}",
                 f"{iso_utc(pt.closed_ts).split('T')[0]} {hm_utc(pt.closed_ts)}" if pt.closed_ts else ""
@@ -1129,15 +1169,15 @@ def load_session_file(path: str) -> List[Tuple[str, str, str, Dict[int, bool]]]:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--session-file", default="session_pairs.txt",
-                    help="Fichier avec lignes SESSION,PAIR,TPx (ex: NY,EURUSD,TP1)")
+                     help="Fichier avec lignes SESSION,PAIR,TPx (ex: NY,EURUSD,TP1)")
     ap.add_argument("--start-date", default="2025-01-01")
     ap.add_argument("--end-date", default="2025-12-31")
-    ap.add_argument("--capital-start", type=float, default=5000.0, help="Capital initial (déf. 100000)")
+    ap.add_argument("--capital-start", type=float, default=5000.0, help="Capital initial (déf. 5000.0)")
     ap.add_argument("--risk-pct", type=float, default=1.0, help="Risque par trade en % du capital disponible")
     ap.add_argument("--fee-per-lot", type=float, default=FEE_PER_LOT,
-                    help=f"Frais USD par lot par transaction (déf. {FEE_PER_LOT})")
+                     help=f"Frais USD par lot par transaction (déf. {FEE_PER_LOT})")
     ap.add_argument("--min-stop-pips", type=float, default=MIN_STOP_PIPS,
-                    help=f"Seuil minimum de stop en pips pour accepter un trade (déf. {MIN_STOP_PIPS})")
+                     help=f"Seuil minimum de stop en pips pour accepter un trade (déf. {MIN_STOP_PIPS})")
     a = ap.parse_args()
 
     session_pairs = load_session_file(a.session_file)
